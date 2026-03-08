@@ -1,0 +1,11 @@
+# CMake generated files
+build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+
+# IDE specific files
+.idea/
+.vscode/

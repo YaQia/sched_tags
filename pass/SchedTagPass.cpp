@@ -7,6 +7,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -28,6 +29,7 @@ static constexpr uint8_t SCHED_COMPUTE_INT = 1;
 static constexpr uint8_t SCHED_COMPUTE_FLOAT = 2;
 static constexpr uint8_t SCHED_COMPUTE_SIMD = 3;
 static constexpr const char *SCHED_HINT_SECTION = "__sched_hint";
+static constexpr int PR_SET_SCHED_HINT_OFFSET = 83;
 
 // Struct field indices (must match getSchedHintType layout)
 static constexpr unsigned FIELD_TAGS_ACTIVE = 3;
@@ -310,23 +312,23 @@ static StructType *getSchedHintType(LLVMContext &Ctx) {
 
   Ty = StructType::create(Ctx,
                           {
-                              I32,                    //  [0] magic
-                              I32,                    //  [1] version
-                              I64,                    //  [2] tags_present
-                              I64,                    //  [3] tags_active
-                              I8,                     //  [4] compute_dense
-                              I8,                     //  [5] branch_dense
-                              I8,                     //  [6] memory_dense
-                              I8,                     //  [7] atomic_dense
-                              I8,                     //  [8] io_dense
-                              I8,                     //  [9] unshared
-                              I8,                     // [10] compute_prep
-                              I8,                     // [11] reserved_pad
-                              I64,                    // [12] atomic_magic
-                              I64,                    // [13] dep_magic
-                              I8,                     // [14] dep_role
-                              ArrayType::get(I8, 7),  // [15] reserved1[7]
-                              ArrayType::get(I8, 8),  // [16] reserved2[8]
+                              I32,                   //  [0] magic
+                              I32,                   //  [1] version
+                              I64,                   //  [2] tags_present
+                              I64,                   //  [3] tags_active
+                              I8,                    //  [4] compute_dense
+                              I8,                    //  [5] branch_dense
+                              I8,                    //  [6] memory_dense
+                              I8,                    //  [7] atomic_dense
+                              I8,                    //  [8] io_dense
+                              I8,                    //  [9] unshared
+                              I8,                    // [10] compute_prep
+                              I8,                    // [11] reserved_pad
+                              I64,                   // [12] atomic_magic
+                              I64,                   // [13] dep_magic
+                              I8,                    // [14] dep_role
+                              ArrayType::get(I8, 7), // [15] reserved1[7]
+                              ArrayType::get(I8, 8), // [16] reserved2[8]
                           },
                           "struct.sched_hint",
                           /*isPacked=*/false);
@@ -379,6 +381,67 @@ static GlobalVariable *getOrCreateSchedHintGV(Module &M) {
   GV->setAlignment(Align(64));
   appendToUsed(M, {GV});
   return GV;
+}
+
+//===----------------------------------------------------------------------===//
+// emitPrctlConstructor — register TLS offset with the kernel via prctl
+//===----------------------------------------------------------------------===//
+//
+// Generates a module constructor equivalent to:
+//
+//   __attribute__((constructor))
+//   void __sched_hint_report(void) {
+//       void *vaddr = &__sched_hint_data;
+//       void *tp    = __builtin_thread_pointer();
+//       long offset = (long)vaddr - (long)tp;
+//       prctl(PR_SET_SCHED_HINT_OFFSET, offset, vaddr);
+//   }
+//
+// The kernel uses `offset` for future child threads (TP + offset → hint addr)
+// and `vaddr` directly for the calling (main) thread.
+
+static void emitPrctlConstructor(Module &M, GlobalVariable *HintGV) {
+  LLVMContext &Ctx = M.getContext();
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *I64 = Type::getInt64Ty(Ctx);
+
+  // void @__sched_hint_report()
+  FunctionType *CtorTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+  Function *Ctor = Function::Create(CtorTy, GlobalValue::InternalLinkage,
+                                    "__sched_hint_report", M);
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Ctor);
+  IRBuilder<> Builder(Entry);
+
+  // %vaddr = ptrtoint ptr @__sched_hint_data to i64
+  //   (TLS address for the current / main thread)
+  Value *VAddr = Builder.CreatePtrToInt(HintGV, I64, "vaddr");
+
+  // %tp = call ptr @llvm.thread.pointer.p0()
+  //   Overloaded intrinsic in LLVM 21+ (llvm_anyptr_ty), needs type arg.
+  Type *PtrTy = PointerType::getUnqual(Ctx);
+  Function *ThreadPtr =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::thread_pointer, {PtrTy});
+  Value *TP = Builder.CreateCall(ThreadPtr, {}, "tp");
+  Value *TPInt = Builder.CreatePtrToInt(TP, I64, "tp.int");
+
+  // %offset = sub i64 %vaddr, %tp.int
+  Value *Offset = Builder.CreateSub(VAddr, TPInt, "offset");
+
+  // Declare: int prctl(int option, ...)
+  FunctionType *PrctlTy = FunctionType::get(I32, {I32}, /*isVarArg=*/true);
+  FunctionCallee Prctl = M.getOrInsertFunction("prctl", PrctlTy);
+
+  // call i32 (i32, ...) @prctl(i32 83, i64 %offset, i64 %vaddr)
+  Builder.CreateCall(
+      Prctl, {ConstantInt::get(I32, PR_SET_SCHED_HINT_OFFSET), Offset, VAddr});
+
+  Builder.CreateRetVoid();
+
+  // Append to @llvm.global_ctors (priority 65535 = default).
+  appendToGlobalCtors(M, Ctor, /*Priority=*/65535);
+
+  errs() << "[SchedTag] emitted prctl constructor __sched_hint_report()\n";
 }
 
 //===----------------------------------------------------------------------===//
@@ -475,6 +538,10 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
   // Create the global variable and instrument IR.
   GlobalVariable *HintGV = getOrCreateSchedHintGV(M);
+
+  // Emit a module constructor that calls prctl() to register
+  // the TLS offset and main-thread address with the kernel.
+  emitPrctlConstructor(M, HintGV);
 
   unsigned LoopSets = 0, LoopClrs = 0, BBSets = 0, BBClrs = 0;
 

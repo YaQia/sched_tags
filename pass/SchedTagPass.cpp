@@ -1,22 +1,61 @@
 #include "SchedTagPass.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
 
 namespace sched_tag {
 
-ComputeDense::ComputeDenseType isComputeDense(Instruction &I) {
-  // 1. 先排除非计算指令
+//===----------------------------------------------------------------------===//
+// Constants — must match sched_hint.h exactly
+//===----------------------------------------------------------------------===//
+static constexpr uint32_t SCHED_HINT_MAGIC = 0x5348494EU;
+static constexpr uint32_t SCHED_HINT_VERSION = 1;
+static constexpr uint64_t SCHED_TAG_COMPUTE_DENSE = 1ULL << 0;
+static constexpr uint8_t SCHED_COMPUTE_NONE = 0;
+static constexpr uint8_t SCHED_COMPUTE_INT = 1;
+static constexpr uint8_t SCHED_COMPUTE_FLOAT = 2;
+static constexpr uint8_t SCHED_COMPUTE_SIMD = 3;
+static constexpr const char *SCHED_HINT_SECTION = "__sched_hint";
+
+// Struct field indices (must match getSchedHintType layout)
+static constexpr unsigned FIELD_TAGS_ACTIVE = 3;
+static constexpr unsigned FIELD_COMPUTE_DENSE = 4;
+
+// Minimum number of instructions in a BB for standalone BB-level tagging.
+static constexpr unsigned MIN_BB_SIZE = 10;
+
+// Minimum total instructions across a loop for loop-level tagging.
+static constexpr unsigned MIN_LOOP_SIZE = 10;
+
+// Density thresholds.
+static constexpr double LOOP_DENSE_THRESHOLD = 0.5;
+static constexpr double BB_DENSE_THRESHOLD = 0.7;
+
+//===----------------------------------------------------------------------===//
+// Per-instruction classification
+//===----------------------------------------------------------------------===//
+
+ComputeOpType computeOpType(Instruction &I) {
+  // Exclude non-compute instructions.
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<PHINode>(I) ||
       isa<SelectInst>(I) || isa<AllocaInst>(I) || I.isTerminator() ||
-      isa<CallInst>(I)) // 函数调用一般不算 ALU，可按需决定
-    return ComputeDense::NONE;
+      isa<CallInst>(I))
+    return ComputeOpType::NONE;
 
-  // 2. 检查操作码是否属于计算指令
   bool isIntOp = false, isFloatOp = false;
   switch (I.getOpcode()) {
-  // 整数二元运算
   case Instruction::Add:
   case Instruction::Sub:
   case Instruction::Mul:
@@ -30,9 +69,7 @@ ComputeDense::ComputeDenseType isComputeDense(Instruction &I) {
   case Instruction::And:
   case Instruction::Or:
   case Instruction::Xor:
-  // 整数比较
   case Instruction::ICmp:
-  // 整数转换（结果类型为整数）
   case Instruction::Trunc:
   case Instruction::ZExt:
   case Instruction::SExt:
@@ -43,7 +80,6 @@ ComputeDense::ComputeDenseType isComputeDense(Instruction &I) {
     isIntOp = true;
     break;
 
-  // 浮点二元运算
   case Instruction::FNeg:
   case Instruction::FAdd:
   case Instruction::FSub:
@@ -58,17 +94,16 @@ ComputeDense::ComputeDenseType isComputeDense(Instruction &I) {
     isFloatOp = true;
     break;
 
-  // 向量专用指令（它们必然涉及向量，应归为 SIMD）
   case Instruction::ExtractElement:
   case Instruction::InsertElement:
   case Instruction::ShuffleVector:
-    return ComputeDense::SIMD;
+    return ComputeOpType::SIMD;
 
   default:
-    return ComputeDense::NONE;
+    return ComputeOpType::NONE;
   }
 
-  // 3. 判断是否涉及向量（结果类型或任一操作数类型为向量）
+  // Vector operands → SIMD regardless of opcode category.
   bool isVector = I.getType()->isVectorTy();
   if (!isVector) {
     for (unsigned i = 0; i < I.getNumOperands(); ++i) {
@@ -78,85 +113,462 @@ ComputeDense::ComputeDenseType isComputeDense(Instruction &I) {
       }
     }
   }
+  if (isVector)
+    return ComputeOpType::SIMD;
 
-  if (isVector) {
-    // 向量指令，不论元素类型，都返回 SIMD
-    return ComputeDense::SIMD;
-  }
-
-  // 4. 标量指令，根据操作码返回 INT 或 FLOAT
   if (isIntOp)
-    return ComputeDense::INT;
+    return ComputeOpType::INT;
   if (isFloatOp)
-    return ComputeDense::FLOAT;
-
-  return ComputeDense::NONE;
+    return ComputeOpType::FLOAT;
+  return ComputeOpType::NONE;
 }
+
+//===----------------------------------------------------------------------===//
+// Helper: classify from (IntCnt, FloatCnt, SIMDCnt, Total) + threshold
+//===----------------------------------------------------------------------===//
+
+static ComputeOpType classifyFromCounts(uint32_t IntCnt, uint32_t FloatCnt,
+                                        uint32_t SIMDCnt, uint32_t Total,
+                                        double Threshold) {
+  if (Total == 0)
+    return ComputeOpType::NONE;
+  double ratio = 1.0 / Total;
+  if (IntCnt * ratio >= Threshold)
+    return ComputeOpType::INT;
+  if (FloatCnt * ratio >= Threshold)
+    return ComputeOpType::FLOAT;
+  if (SIMDCnt * ratio >= Threshold)
+    return ComputeOpType::SIMD;
+  return ComputeOpType::NONE;
+}
+
+//===----------------------------------------------------------------------===//
+// ComputeDense::run — unified density analysis
+//===----------------------------------------------------------------------===//
 
 AnalysisKey ComputeDense::Key;
+
 ComputeDense::Result ComputeDense::run(Function &F,
                                        FunctionAnalysisManager &FAM) {
-  Result ResultMap;
+  DensityResult Plan;
 
-    for (BasicBlock &BB : F) {
-      uint32_t IntCnt, FloatCnt, SIMDCnt;
-      for (Instruction &Inst : BB) {
-        switch (isComputeDense(Inst)) {
-          case INT:
-            IntCnt++;
-            break;
-          case FLOAT:
-            FloatCnt++;
-            break;
-          case SIMD:
-            SIMDCnt++;
-            break;
-          default: // NONE
-            break;
-        }
+  //--- Step 1: Single pass — cache per-BB instruction counts ---------------
+
+  struct BBCounts {
+    uint32_t Total = 0;
+    uint32_t IntCnt = 0;
+    uint32_t FloatCnt = 0;
+    uint32_t SIMDCnt = 0;
+  };
+
+  DenseMap<BasicBlock *, BBCounts> BBStats;
+
+  for (BasicBlock &BB : F) {
+    BBCounts C;
+    for (Instruction &I : BB) {
+      C.Total++;
+      switch (computeOpType(I)) {
+      case ComputeOpType::INT:
+        C.IntCnt++;
+        break;
+      case ComputeOpType::FLOAT:
+        C.FloatCnt++;
+        break;
+      case ComputeOpType::SIMD:
+        C.SIMDCnt++;
+        break;
+      default:
+        break;
       }
-      if (IntCnt * 1.0 / BB.size() >= 0.7) {
-        // INT 密集
-        ResultMap[&BB] = INT;
-      } else if (FloatCnt * 1.0 / BB.size() >= 0.7) {
-        // FLOAT 密集
-        ResultMap[&BB] = FLOAT;
-      } else if (SIMDCnt * 1.0 / BB.size() >= 0.7) {
-        // SIMD 密集
-        ResultMap[&BB] = SIMD;
-      }
+    }
+    BBStats[&BB] = C;
   }
-  return ResultMap;
+
+  //--- Step 2: Loop-level analysis (outermost-first) -----------------------
+  //
+  // Aggregate the cached per-BB counts across each loop's blocks.
+  // If an outer loop is dense, all its BBs (including sub-loop BBs) are
+  // "covered" and won't need standalone BB-level instrumentation.
+
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  DenseSet<BasicBlock *> CoveredByLoop;
+
+  SmallVector<Loop *, 8> Worklist;
+  for (Loop *TopL : LI)
+    Worklist.push_back(TopL);
+
+  while (!Worklist.empty()) {
+    Loop *L = Worklist.pop_back_val();
+
+    // Skip if already covered by an outer dense loop.
+    bool AlreadyCovered = false;
+    for (BasicBlock *BB : L->getBlocks()) {
+      if (CoveredByLoop.contains(BB)) {
+        AlreadyCovered = true;
+        break;
+      }
+    }
+    if (AlreadyCovered)
+      continue;
+
+    // Aggregate counts from cached per-BB stats — no re-traversal.
+    uint32_t Total = 0, IntCnt = 0, FloatCnt = 0, SIMDCnt = 0;
+    for (BasicBlock *BB : L->getBlocks()) {
+      auto It = BBStats.find(BB);
+      if (It == BBStats.end())
+        continue;
+      const BBCounts &C = It->second;
+      Total += C.Total;
+      IntCnt += C.IntCnt;
+      FloatCnt += C.FloatCnt;
+      SIMDCnt += C.SIMDCnt;
+    }
+
+    if (Total < MIN_LOOP_SIZE) {
+      // Too small — recurse into sub-loops.
+      for (Loop *Sub : L->getSubLoops())
+        Worklist.push_back(Sub);
+      continue;
+    }
+
+    ComputeOpType LoopType = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt,
+                                                Total, LOOP_DENSE_THRESHOLD);
+    if (LoopType == ComputeOpType::NONE) {
+      // Not dense as a whole — try sub-loops.
+      for (Loop *Sub : L->getSubLoops())
+        Worklist.push_back(Sub);
+      continue;
+    }
+
+    // Dense loop — need a preheader to instrument.
+    BasicBlock *Preheader = L->getLoopPreheader();
+    if (!Preheader) {
+      // Can't cleanly instrument without a preheader.  Fall through.
+      for (Loop *Sub : L->getSubLoops())
+        Worklist.push_back(Sub);
+      continue;
+    }
+
+    // Collect and deduplicate exit blocks.
+    SmallVector<BasicBlock *, 4> RawExits;
+    L->getExitBlocks(RawExits);
+
+    LoopRegion LR;
+    LR.Preheader = Preheader;
+    LR.Type = LoopType;
+
+    DenseSet<BasicBlock *> Seen;
+    for (BasicBlock *Exit : RawExits) {
+      if (Seen.insert(Exit).second)
+        LR.ExitBlocks.push_back(Exit);
+    }
+
+    Plan.Loops.push_back(std::move(LR));
+
+    // Mark all loop BBs as covered.
+    for (BasicBlock *BB : L->getBlocks())
+      CoveredByLoop.insert(BB);
+    // Don't recurse into sub-loops — they're covered.
+  }
+
+  //--- Step 3: BB-level fallback -------------------------------------------
+  //
+  // Dense BBs not inside any dense loop get standalone SET+CLR.
+
+  for (BasicBlock &BB : F) {
+    if (CoveredByLoop.contains(&BB))
+      continue;
+
+    const BBCounts &C = BBStats[&BB];
+    if (C.Total < MIN_BB_SIZE)
+      continue;
+
+    ComputeOpType BBType = classifyFromCounts(C.IntCnt, C.FloatCnt, C.SIMDCnt,
+                                              C.Total, BB_DENSE_THRESHOLD);
+    if (BBType == ComputeOpType::NONE)
+      continue;
+
+    Plan.StandaloneBBs.push_back({&BB, BBType});
+  }
+
+  return Plan;
 }
 
-PreservedAnalyses SchedTagPass::run(Function &F, FunctionAnalysisManager &FAM) {
-  // TODO: Insert code for tags
-  auto ComputeDenseMap = FAM.getResult<ComputeDense>(F);
-  return PreservedAnalyses::all();
+//===----------------------------------------------------------------------===//
+// getSchedHintType — LLVM struct matching sched_hint.h (64 bytes)
+//===----------------------------------------------------------------------===//
+
+static StructType *getSchedHintType(LLVMContext &Ctx) {
+  StructType *Ty = StructType::getTypeByName(Ctx, "struct.sched_hint");
+  if (Ty)
+    return Ty;
+
+  auto *I8 = Type::getInt8Ty(Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *I64 = Type::getInt64Ty(Ctx);
+
+  Ty = StructType::create(Ctx,
+                          {
+                              I32,                    //  [0] magic
+                              I32,                    //  [1] version
+                              I64,                    //  [2] tags_present
+                              I64,                    //  [3] tags_active
+                              I8,                     //  [4] compute_dense
+                              I8,                     //  [5] branch_dense
+                              I8,                     //  [6] memory_dense
+                              I8,                     //  [7] atomic_dense
+                              I8,                     //  [8] io_dense
+                              I8,                     //  [9] unshared
+                              I8,                     // [10] compute_prep
+                              I8,                     // [11] reserved_pad
+                              I64,                    // [12] atomic_magic
+                              I64,                    // [13] dep_magic
+                              I8,                     // [14] dep_role
+                              ArrayType::get(I8, 7),  // [15] reserved1[7]
+                              ArrayType::get(I8, 8),  // [16] reserved2[8]
+                          },
+                          "struct.sched_hint",
+                          /*isPacked=*/false);
+
+  return Ty;
+}
+
+//===----------------------------------------------------------------------===//
+// getOrCreateSchedHintGV
+//===----------------------------------------------------------------------===//
+
+static GlobalVariable *getOrCreateSchedHintGV(Module &M) {
+  if (auto *Existing = M.getNamedGlobal("__sched_hint_data"))
+    return Existing;
+
+  LLVMContext &Ctx = M.getContext();
+  StructType *HintTy = getSchedHintType(Ctx);
+  auto *I8 = Type::getInt8Ty(Ctx);
+  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *I64 = Type::getInt64Ty(Ctx);
+
+  Constant *Init = ConstantStruct::get(
+      HintTy,
+      {
+          ConstantInt::get(I32, SCHED_HINT_MAGIC),
+          ConstantInt::get(I32, SCHED_HINT_VERSION),
+          ConstantInt::get(I64, SCHED_TAG_COMPUTE_DENSE), // tags_present
+          ConstantInt::get(I64, 0),                       // tags_active
+          ConstantInt::get(I8, SCHED_COMPUTE_NONE),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I8, 0),
+          ConstantInt::get(I64, 0),
+          ConstantInt::get(I64, 0),
+          ConstantInt::get(I8, 0),
+          ConstantAggregateZero::get(ArrayType::get(I8, 7)),
+          ConstantAggregateZero::get(ArrayType::get(I8, 8)),
+      });
+
+  auto *GV = new GlobalVariable(M, HintTy, /*isConstant=*/false,
+                                GlobalValue::ExternalLinkage, Init,
+                                "__sched_hint_data");
+
+  GV->setThreadLocalMode(GlobalValue::InitialExecTLSModel);
+  GV->setSection(SCHED_HINT_SECTION);
+  GV->setAlignment(Align(64));
+  appendToUsed(M, {GV});
+  return GV;
+}
+
+//===----------------------------------------------------------------------===//
+// Instrumentation helpers
+//===----------------------------------------------------------------------===//
+
+static uint8_t denseTypeToHintConst(ComputeOpType T) {
+  switch (T) {
+  case ComputeOpType::INT:
+    return SCHED_COMPUTE_INT;
+  case ComputeOpType::FLOAT:
+    return SCHED_COMPUTE_FLOAT;
+  case ComputeOpType::SIMD:
+    return SCHED_COMPUTE_SIMD;
+  default:
+    return SCHED_COMPUTE_NONE;
+  }
+}
+
+static const char *hintConstName(uint8_t C) {
+  switch (C) {
+  case SCHED_COMPUTE_INT:
+    return "INT";
+  case SCHED_COMPUTE_FLOAT:
+    return "FLOAT";
+  case SCHED_COMPUTE_SIMD:
+    return "SIMD";
+  default:
+    return "NONE";
+  }
+}
+
+/// Emit tag stores at the current IRBuilder insertion point:
+///   store i8 <type>, &hint.compute_dense
+///   old = load i64, &hint.tags_active
+///   new = old | bit   (or  old & ~bit  for NONE)
+///   store i64 new, &hint.tags_active
+static void emitTagStores(IRBuilder<> &Builder, GlobalVariable *GV,
+                          uint8_t ComputeType) {
+  LLVMContext &Ctx = Builder.getContext();
+  StructType *HintTy = getSchedHintType(Ctx);
+
+  Value *ComputePtr = Builder.CreateStructGEP(HintTy, GV, FIELD_COMPUTE_DENSE,
+                                              "hint.compute.ptr");
+  Builder.CreateStore(ConstantInt::get(Type::getInt8Ty(Ctx), ComputeType),
+                      ComputePtr);
+
+  Value *TagsPtr =
+      Builder.CreateStructGEP(HintTy, GV, FIELD_TAGS_ACTIVE, "hint.tags.ptr");
+  LoadInst *OldTags =
+      Builder.CreateLoad(Type::getInt64Ty(Ctx), TagsPtr, "hint.tags.old");
+
+  Value *NewTags;
+  if (ComputeType != SCHED_COMPUTE_NONE) {
+    NewTags = Builder.CreateOr(
+        OldTags,
+        ConstantInt::get(Type::getInt64Ty(Ctx), SCHED_TAG_COMPUTE_DENSE),
+        "hint.tags.set");
+  } else {
+    NewTags = Builder.CreateAnd(
+        OldTags,
+        ConstantInt::get(Type::getInt64Ty(Ctx), ~SCHED_TAG_COMPUTE_DENSE),
+        "hint.tags.clear");
+  }
+  Builder.CreateStore(NewTags, TagsPtr);
+}
+
+//===----------------------------------------------------------------------===//
+// SchedTagPass::run — pure instrumentation, no analysis
+//===----------------------------------------------------------------------===//
+
+PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
+  auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
+  // Collect plans from all functions (read-only phase).
+  struct FuncPlan {
+    Function *F;
+    DensityResult Plan;
+  };
+  SmallVector<FuncPlan, 8> AllPlans;
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto Plan = FAM.getResult<ComputeDense>(F);
+    if (!Plan.empty())
+      AllPlans.push_back({&F, std::move(Plan)});
+  }
+
+  if (AllPlans.empty()) {
+    errs() << "[SchedTag] no compute-dense regions found, skipping.\n";
+    return PreservedAnalyses::all();
+  }
+
+  // Create the global variable and instrument IR.
+  GlobalVariable *HintGV = getOrCreateSchedHintGV(M);
+
+  unsigned LoopSets = 0, LoopClrs = 0, BBSets = 0, BBClrs = 0;
+
+  for (auto &[FuncPtr, Plan] : AllPlans) {
+    Function &F = *FuncPtr;
+
+    // --- Loop-level instrumentation ---
+    for (auto &LR : Plan.Loops) {
+      uint8_t ComputeType = denseTypeToHintConst(LR.Type);
+
+      // SET before the branch into the loop header.
+      {
+        IRBuilder<> Builder(LR.Preheader->getTerminator());
+        emitTagStores(Builder, HintGV, ComputeType);
+      }
+      LoopSets++;
+
+      errs() << "[SchedTag]   LOOP SET  " << F.getName() << "::preheader("
+             << LR.Preheader->getName() << ") -> " << hintConstName(ComputeType)
+             << "\n";
+
+      // CLR at entry of each exit block.
+      for (BasicBlock *Exit : LR.ExitBlocks) {
+        IRBuilder<> Builder(&*Exit->getFirstNonPHIOrDbg());
+        emitTagStores(Builder, HintGV, SCHED_COMPUTE_NONE);
+        LoopClrs++;
+
+        errs() << "[SchedTag]   LOOP CLR  " << F.getName() << "::exit("
+               << Exit->getName() << ") -> NONE\n";
+      }
+    }
+
+    // --- BB-level instrumentation ---
+    for (auto &BR : Plan.StandaloneBBs) {
+      uint8_t ComputeType = denseTypeToHintConst(BR.Type);
+
+      // SET at BB entry (after PHI nodes).
+      {
+        IRBuilder<> Builder(&*BR.BB->getFirstNonPHIOrDbg());
+        emitTagStores(Builder, HintGV, ComputeType);
+      }
+      BBSets++;
+
+      // CLR before terminator.
+      {
+        IRBuilder<> Builder(BR.BB->getTerminator());
+        emitTagStores(Builder, HintGV, SCHED_COMPUTE_NONE);
+      }
+      BBClrs++;
+
+      errs() << "[SchedTag]   BB   SET+CLR  " << F.getName()
+             << "::" << BR.BB->getName() << " -> " << hintConstName(ComputeType)
+             << "\n";
+    }
+  }
+
+  errs() << "[SchedTag] instrumented: " << LoopSets << " loop-SET, " << LoopClrs
+         << " loop-CLR, " << BBSets << " bb-SET, " << BBClrs << " bb-CLR "
+         << "across " << AllPlans.size() << " functions.\n";
+
+  return PreservedAnalyses::none();
 }
 
 } // namespace sched_tag
 
 //===----------------------------------------------------------------------===//
-// New PM (Pass Manager) plugin registration
+// New PM plugin registration
 //===----------------------------------------------------------------------===//
 
-// This is the entry point for the pass plugin.
-// `opt` will call this function to register the pass when loading the plugin.
 llvm::PassPluginLibraryInfo getSchedTagPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "SchedTag", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
-            // Register the pass so it can be used via:
-            //   opt -passes=sched-tag ...
+            // Manual: opt -passes=sched-tag
             PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
+                [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "sched-tag") {
-                    FPM.addPass(sched_tag::SchedTagPass());
+                    MPM.addPass(sched_tag::SchedTagPass());
                     return true;
                   }
                   return false;
                 });
+
+            // Automatic: run at the very end of the optimisation pipeline
+            // (after Loop Vectorizer, SLP Vectorizer, and all clean-up
+            // passes) so that the density analysis sees compiler-generated
+            // SIMD instructions.
+            PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+                                                  OptimizationLevel Level,
+                                                  ThinOrFullLTOPhase) {
+              if (Level != OptimizationLevel::O0)
+                MPM.addPass(sched_tag::SchedTagPass());
+            });
+
             PB.registerAnalysisRegistrationCallback(
                 [](FunctionAnalysisManager &FAM) {
                   FAM.registerPass([&] { return sched_tag::ComputeDense(); });
@@ -164,7 +576,6 @@ llvm::PassPluginLibraryInfo getSchedTagPluginInfo() {
           }};
 }
 
-// The public entry point for a pass plugin.
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return getSchedTagPluginInfo();

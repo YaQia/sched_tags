@@ -16,7 +16,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
+#include <string.h>
 #include "../include/sched_hint.h"
 
 /* The pass emits this TLS global in the __sched_hint section. */
@@ -27,7 +27,7 @@ extern int workload(int n, double x);
 extern int trivial(int a);
 
 /*=========================================================================*/
-/* Observation callback — called from inside dense regions in the .ll       */
+/* Observation callback — called from inside dense regions in the .ll      */
 /*=========================================================================*/
 
 /* Snapshot captured by the most recent observe_hint call. */
@@ -45,16 +45,26 @@ void observe_hint(int tag_id) {
 }
 
 /*=========================================================================*/
-/* Helpers                                                                  */
+/* Helpers                                                                 */
 /*=========================================================================*/
 
 static const char *compute_name(uint8_t t) {
-    switch (t) {
-    case SCHED_COMPUTE_INT:   return "INT";
-    case SCHED_COMPUTE_FLOAT: return "FLOAT";
-    case SCHED_COMPUTE_SIMD:  return "SIMD";
-    default:                  return "NONE";
+    static char buf[32];
+    if (t == SCHED_COMPUTE_NONE) return "NONE";
+    buf[0] = '\0';
+    if (t & SCHED_COMPUTE_INT) {
+        if (buf[0]) strcat(buf, "|");
+        strcat(buf, "INT");
     }
+    if (t & SCHED_COMPUTE_FLOAT) {
+        if (buf[0]) strcat(buf, "|");
+        strcat(buf, "FLOAT");
+    }
+    if (t & SCHED_COMPUTE_SIMD) {
+        if (buf[0]) strcat(buf, "|");
+        strcat(buf, "SIMD");
+    }
+    return buf;
 }
 
 static int failures = 0;
@@ -79,7 +89,7 @@ static void dump_current(const char *label) {
 }
 
 /*=========================================================================*/
-/* main                                                                     */
+/* main                                                                    */
 /*=========================================================================*/
 
 int main(void) {

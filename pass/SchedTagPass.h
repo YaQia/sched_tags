@@ -30,13 +30,13 @@ ComputeOpType computeOpType(llvm::Instruction &I);
 struct LoopRegion {
   llvm::BasicBlock *Preheader;                       // SET here
   llvm::SmallVector<llvm::BasicBlock *, 4> ExitBlocks; // CLR here
-  ComputeOpType Type;
+  uint8_t TypeMask;  // bitmask of SCHED_COMPUTE_* bits
 };
 
 /// A standalone dense BB (not covered by any dense loop).
 struct BBRegion {
   llvm::BasicBlock *BB;
-  ComputeOpType Type;
+  uint8_t TypeMask;  // bitmask of SCHED_COMPUTE_* bits
 };
 
 /// Per-function instrumentation plan produced by ComputeDense analysis.

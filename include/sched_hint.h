@@ -66,7 +66,7 @@ extern "C" {
 |* (statically determined at compile time) or active (may be toggled at       *|
 |* runtime for dynamic tags).                                                 *|
 |*                                                                            *|
-|* Using uint64_t gives us 64 tag slots. Bits 0..7 are allocated below;      *|
+|* Using uint64_t gives us 64 tag slots. Bits 0..7 are allocated below;       *|
 |* bits 8..63 are reserved for future tag types.                              *|
 \*===----------------------------------------------------------------------===*/
 
@@ -81,14 +81,15 @@ extern "C" {
 /* bits 8..63: reserved for future tags                                       */
 
 /*===----------------------------------------------------------------------===*\
-|* compute-dense sub-type (2 bits)                                            *|
-|* Encodes the dominant compute type when SCHED_TAG_COMPUTE_DENSE is set.     *|
+|* compute-dense sub-type (bitmask, 3 bits)                                   *|
+|* Bitmask of compute types present when SCHED_TAG_COMPUTE_DENSE is set.      *|
+|* Multiple bits may be set simultaneously (e.g. INT | FLOAT).                *|
 \*===----------------------------------------------------------------------===*/
 
-#define SCHED_COMPUTE_NONE   0  /* no dominant compute type                   */
-#define SCHED_COMPUTE_INT    1  /* integer ALU dominant                       */
-#define SCHED_COMPUTE_FLOAT  2  /* floating-point dominant                    */
-#define SCHED_COMPUTE_SIMD   3  /* vector / SIMD dominant                     */
+#define SCHED_COMPUTE_NONE   0          /* no compute type present            */
+#define SCHED_COMPUTE_INT    (1U << 0)  /* integer ALU                        */
+#define SCHED_COMPUTE_FLOAT  (1U << 1)  /* floating-point                     */
+#define SCHED_COMPUTE_SIMD   (1U << 2)  /* vector / SIMD                      */
 
 /*===----------------------------------------------------------------------===*\
 |* memory-dense sub-type (2 bits)                                             *|
@@ -109,7 +110,7 @@ extern "C" {
 |*   [8..15]   tags_present   — bitmap: which tags are statically set         *|
 |*   [16..23]  tags_active    — bitmap: runtime-toggleable copy (mutable)     *|
 |*                                                                            *|
-|*   --- Tag payloads (fixed offsets for kernel fast-path access) ---          *|
+|*   --- Tag payloads (fixed offsets for kernel fast-path access) ---         *|
 |*                                                                            *|
 |*   [24]      compute_dense  — SCHED_COMPUTE_xxx sub-type                    *|
 |*   [25]      branch_dense   — 0/1                                           *|
@@ -129,7 +130,7 @@ extern "C" {
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
-struct sched_hint {
+struct __attribute__((aligned(64))) sched_hint {
     /* ---- header (24 bytes) ---- */
     uint32_t magic;             /* SCHED_HINT_MAGIC                           */
     uint32_t version;           /* SCHED_HINT_VERSION                         */
@@ -165,7 +166,7 @@ _Static_assert(sizeof(struct sched_hint) == 64,
 |*                                                                            *|
 |* The hint variable is Thread-Local Storage (TLS). Every extern declaration  *|
 |* must include the TLS specifier so the linker resolves it correctly         *|
-|* (ELF symbol type STT_TLS).                                                *|
+|* (ELF symbol type STT_TLS).                                                 *|
 |*                                                                            *|
 |* In userspace:                                                              *|
 |*   extern SCHED_HINT_TLS struct sched_hint __sched_hint_data;               *|
@@ -173,15 +174,14 @@ _Static_assert(sizeof(struct sched_hint) == 64,
 |*                                                                            *|
 |* In kernel space (after your ELF loader modification):                      *|
 |*   struct sched_hint *hint = current->sched_hint;                           *|
-|*   if (hint && hint->magic == SCHED_HINT_MAGIC) { ... }                    *|
+|*   if (hint && hint->magic == SCHED_HINT_MAGIC) { ... }                     *|
 |*                                                                            *|
 |* Fast-path check example:                                                   *|
 |*   if (hint->tags_active & SCHED_TAG_COMPUTE_DENSE) {                      *|
-|*       switch (hint->compute_dense) {                                       *|
-|*       case SCHED_COMPUTE_INT:   ... break;                                 *|
-|*       case SCHED_COMPUTE_FLOAT: ... break;                                 *|
-|*       case SCHED_COMPUTE_SIMD:  ... break;                                 *|
-|*       }                                                                    *|
+|*       uint8_t m = hint->compute_dense;                                     *|
+|*       if (m & SCHED_COMPUTE_INT)   { ... }                                *|
+|*       if (m & SCHED_COMPUTE_FLOAT) { ... }                                *|
+|*       if (m & SCHED_COMPUTE_SIMD)  { ... }                                *|
 |*   }                                                                        *|
 \*===----------------------------------------------------------------------===*/
 

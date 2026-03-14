@@ -25,9 +25,9 @@ static constexpr uint32_t SCHED_HINT_MAGIC = 0x5348494EU;
 static constexpr uint32_t SCHED_HINT_VERSION = 1;
 static constexpr uint64_t SCHED_TAG_COMPUTE_DENSE = 1ULL << 0;
 static constexpr uint8_t SCHED_COMPUTE_NONE = 0;
-static constexpr uint8_t SCHED_COMPUTE_INT = 1;
-static constexpr uint8_t SCHED_COMPUTE_FLOAT = 2;
-static constexpr uint8_t SCHED_COMPUTE_SIMD = 3;
+static constexpr uint8_t SCHED_COMPUTE_INT = 1U << 0;
+static constexpr uint8_t SCHED_COMPUTE_FLOAT = 1U << 1;
+static constexpr uint8_t SCHED_COMPUTE_SIMD = 1U << 2;
 static constexpr const char *SCHED_HINT_SECTION = "__sched_hint";
 static constexpr int PR_SET_SCHED_HINT_OFFSET = 83;
 
@@ -125,23 +125,40 @@ ComputeOpType computeOpType(Instruction &I) {
   return ComputeOpType::NONE;
 }
 
+// Minimum fraction of compute instructions a single type must represent
+// before its bit is set in the bitmask.  Filters out incidental instructions
+// (e.g. a lone loop-counter `add` in an otherwise pure-FLOAT region).
+static constexpr double PER_TYPE_FRACTION = 0.25;
+
 //===----------------------------------------------------------------------===//
 // Helper: classify from (IntCnt, FloatCnt, SIMDCnt, Total) + threshold
 //===----------------------------------------------------------------------===//
 
-static ComputeOpType classifyFromCounts(uint32_t IntCnt, uint32_t FloatCnt,
-                                        uint32_t SIMDCnt, uint32_t Total,
-                                        double Threshold) {
+/// Return a bitmask of SCHED_COMPUTE_* bits.
+/// 1. The combined compute ratio (INT+FLOAT+SIMD)/Total must meet Threshold.
+/// 2. Each individual type must represent >= PER_TYPE_FRACTION of compute
+///    instructions to earn its bit.
+static uint8_t classifyFromCounts(uint32_t IntCnt, uint32_t FloatCnt,
+                                  uint32_t SIMDCnt, uint32_t Total,
+                                  double Threshold) {
   if (Total == 0)
-    return ComputeOpType::NONE;
-  double ratio = 1.0 / Total;
-  if (IntCnt * ratio >= Threshold)
-    return ComputeOpType::INT;
-  if (FloatCnt * ratio >= Threshold)
-    return ComputeOpType::FLOAT;
-  if (SIMDCnt * ratio >= Threshold)
-    return ComputeOpType::SIMD;
-  return ComputeOpType::NONE;
+    return SCHED_COMPUTE_NONE;
+
+  uint32_t ComputeTotal = IntCnt + FloatCnt + SIMDCnt;
+  if (static_cast<double>(ComputeTotal) / Total < Threshold)
+    return SCHED_COMPUTE_NONE;
+
+  // Combined compute ratio meets threshold — set bits only for types
+  // that represent a significant fraction of the compute instructions.
+  uint8_t Mask = 0;
+  double CT = static_cast<double>(ComputeTotal);
+  if (IntCnt > 0 && IntCnt / CT >= PER_TYPE_FRACTION)
+    Mask |= SCHED_COMPUTE_INT;
+  if (FloatCnt > 0 && FloatCnt / CT >= PER_TYPE_FRACTION)
+    Mask |= SCHED_COMPUTE_FLOAT;
+  if (SIMDCnt > 0 && SIMDCnt / CT >= PER_TYPE_FRACTION)
+    Mask |= SCHED_COMPUTE_SIMD;
+  return Mask;
 }
 
 //===----------------------------------------------------------------------===//
@@ -234,9 +251,9 @@ ComputeDense::Result ComputeDense::run(Function &F,
       continue;
     }
 
-    ComputeOpType LoopType = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt,
-                                                Total, LOOP_DENSE_THRESHOLD);
-    if (LoopType == ComputeOpType::NONE) {
+    uint8_t LoopMask = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt, Total,
+                                          LOOP_DENSE_THRESHOLD);
+    if (LoopMask == SCHED_COMPUTE_NONE) {
       // Not dense as a whole — try sub-loops.
       for (Loop *Sub : L->getSubLoops())
         Worklist.push_back(Sub);
@@ -258,7 +275,7 @@ ComputeDense::Result ComputeDense::run(Function &F,
 
     LoopRegion LR;
     LR.Preheader = Preheader;
-    LR.Type = LoopType;
+    LR.TypeMask = LoopMask;
 
     DenseSet<BasicBlock *> Seen;
     for (BasicBlock *Exit : RawExits) {
@@ -286,12 +303,12 @@ ComputeDense::Result ComputeDense::run(Function &F,
     if (C.Total < MIN_BB_SIZE)
       continue;
 
-    ComputeOpType BBType = classifyFromCounts(C.IntCnt, C.FloatCnt, C.SIMDCnt,
-                                              C.Total, BB_DENSE_THRESHOLD);
-    if (BBType == ComputeOpType::NONE)
+    uint8_t BBMask = classifyFromCounts(C.IntCnt, C.FloatCnt, C.SIMDCnt,
+                                        C.Total, BB_DENSE_THRESHOLD);
+    if (BBMask == SCHED_COMPUTE_NONE)
       continue;
 
-    Plan.StandaloneBBs.push_back({&BB, BBType});
+    Plan.StandaloneBBs.push_back({&BB, BBMask});
   }
 
   return Plan;
@@ -433,8 +450,9 @@ static void emitPrctlConstructor(Module &M, GlobalVariable *HintGV) {
   FunctionCallee Prctl = M.getOrInsertFunction("prctl", PrctlTy);
 
   // call i32 (i32, ...) @prctl(i32 83, i64 %offset, i64 %vaddr)
-  Builder.CreateCall(
-      Prctl, {ConstantInt::get(I32, PR_SET_SCHED_HINT_OFFSET), Offset, VAddr});
+  Builder.CreateCall(Prctl, {ConstantInt::get(I32, PR_SET_SCHED_HINT_OFFSET),
+                             Offset, VAddr, ConstantInt::get(I32, 0),
+                             ConstantInt::get(I32, 0)});
 
   Builder.CreateRetVoid();
 
@@ -448,30 +466,26 @@ static void emitPrctlConstructor(Module &M, GlobalVariable *HintGV) {
 // Instrumentation helpers
 //===----------------------------------------------------------------------===//
 
-static uint8_t denseTypeToHintConst(ComputeOpType T) {
-  switch (T) {
-  case ComputeOpType::INT:
-    return SCHED_COMPUTE_INT;
-  case ComputeOpType::FLOAT:
-    return SCHED_COMPUTE_FLOAT;
-  case ComputeOpType::SIMD:
-    return SCHED_COMPUTE_SIMD;
-  default:
-    return SCHED_COMPUTE_NONE;
-  }
-}
-
-static const char *hintConstName(uint8_t C) {
-  switch (C) {
-  case SCHED_COMPUTE_INT:
-    return "INT";
-  case SCHED_COMPUTE_FLOAT:
-    return "FLOAT";
-  case SCHED_COMPUTE_SIMD:
-    return "SIMD";
-  default:
+static std::string hintMaskName(uint8_t Mask) {
+  if (Mask == SCHED_COMPUTE_NONE)
     return "NONE";
+  std::string S;
+  if (Mask & SCHED_COMPUTE_INT) {
+    if (!S.empty())
+      S += "|";
+    S += "INT";
   }
+  if (Mask & SCHED_COMPUTE_FLOAT) {
+    if (!S.empty())
+      S += "|";
+    S += "FLOAT";
+  }
+  if (Mask & SCHED_COMPUTE_SIMD) {
+    if (!S.empty())
+      S += "|";
+    S += "SIMD";
+  }
+  return S;
 }
 
 /// Emit tag stores at the current IRBuilder insertion point:
@@ -550,17 +564,17 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
     // --- Loop-level instrumentation ---
     for (auto &LR : Plan.Loops) {
-      uint8_t ComputeType = denseTypeToHintConst(LR.Type);
+      uint8_t ComputeMask = LR.TypeMask;
 
       // SET before the branch into the loop header.
       {
         IRBuilder<> Builder(LR.Preheader->getTerminator());
-        emitTagStores(Builder, HintGV, ComputeType);
+        emitTagStores(Builder, HintGV, ComputeMask);
       }
       LoopSets++;
 
       errs() << "[SchedTag]   LOOP SET  " << F.getName() << "::preheader("
-             << LR.Preheader->getName() << ") -> " << hintConstName(ComputeType)
+             << LR.Preheader->getName() << ") -> " << hintMaskName(ComputeMask)
              << "\n";
 
       // CLR at entry of each exit block.
@@ -576,12 +590,12 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
     // --- BB-level instrumentation ---
     for (auto &BR : Plan.StandaloneBBs) {
-      uint8_t ComputeType = denseTypeToHintConst(BR.Type);
+      uint8_t ComputeMask = BR.TypeMask;
 
       // SET at BB entry (after PHI nodes).
       {
         IRBuilder<> Builder(&*BR.BB->getFirstNonPHIOrDbg());
-        emitTagStores(Builder, HintGV, ComputeType);
+        emitTagStores(Builder, HintGV, ComputeMask);
       }
       BBSets++;
 
@@ -593,7 +607,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
       BBClrs++;
 
       errs() << "[SchedTag]   BB   SET+CLR  " << F.getName()
-             << "::" << BR.BB->getName() << " -> " << hintConstName(ComputeType)
+             << "::" << BR.BB->getName() << " -> " << hintMaskName(ComputeMask)
              << "\n";
     }
   }

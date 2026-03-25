@@ -1,45 +1,50 @@
 /*
- * test/reader.c — Runtime verification of __sched_hint BB-level instrumentation.
+ * test/reader_obfuscated.c — Runtime verification with obfuscated symbol names.
  *
- * The .ll test files call observe_hint(tag_id) from INSIDE dense regions.
- * This callback captures the hint state while SET is active, so we can
- * verify that tags_active and compute_dense are correct during execution.
- *
- * Note: Tag clearing is now handled by the kernel scheduler on context switch,
- *       not by the instrumented code. Tests only verify SET behavior.
+ * This test uses dynamic symbol lookup to find the sched_hint TLS variable
+ * even when it has an obfuscated name with special characters.
  *
  * Build & run:
+ *   # With custom symbol name (for testing):
+ *   opt -load-pass-plugin=build/pass/libSchedTagPass.so \
+ *       -passes=sched-tag -sched-hint-symbol="__sched_hint.test$123" \
+ *       test/test_dense.ll -o /tmp/tagged.bc
+ *
+ *   # With random obfuscated name (production):
  *   opt -load-pass-plugin=build/pass/libSchedTagPass.so \
  *       -passes=sched-tag test/test_dense.ll -o /tmp/tagged.bc
+ *
  *   llc /tmp/tagged.bc -filetype=obj -o /tmp/tagged.o
- *   clang /tmp/tagged.o test/reader.c -lm -o /tmp/test_reader
- *   /tmp/test_reader
+ *   clang /tmp/tagged.o test/reader_obfuscated.c -o /tmp/test_obfuscated
+ *   /tmp/test_obfuscated
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/sched_hint.h"
-
-/* The pass emits this TLS global in the __sched_hint section. */
-extern __thread struct sched_hint __sched_hint_data;
+#include "reader_dynamic.h"
 
 /* Functions from the instrumented module. */
 extern int workload(int n, double x);
 extern int trivial(int a);
 
 /*=========================================================================*/
-/* Observation callback — called from inside dense regions in the .ll      */
+/* Observation callback — called from inside dense regions                */
 /*=========================================================================*/
 
 /* Snapshot captured by the most recent observe_hint call. */
 static uint8_t  observed_compute_dense;
 static int      observed_tag_id;
 static int      observe_count;
+static struct sched_hint *g_hint;  /* Global pointer to TLS variable */
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
-    observed_compute_dense = h->compute_dense;
+    if (!g_hint) {
+        fprintf(stderr, "ERROR: observe_hint called but g_hint is NULL\n");
+        return;
+    }
+    observed_compute_dense = g_hint->compute_dense;
     observed_tag_id       = tag_id;
     observe_count++;
 }
@@ -79,33 +84,33 @@ static void check(const char *label, uint8_t expect_compute,
     if (!ok) failures++;
 }
 
-static void dump_current(const char *label) {
-    struct sched_hint *h = &__sched_hint_data;
-    printf("  [%-28s] compute_dense=%s\n",
-           label,
-           compute_name(h->compute_dense));
-}
-
 /*=========================================================================*/
 /* main                                                                    */
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *h = &__sched_hint_data;
+    printf("=== Testing with obfuscated TLS symbol ===\n\n");
+    
+    /* Find the TLS variable dynamically */
+    g_hint = find_sched_hint_var();
+    if (!g_hint) {
+        fprintf(stderr, "FATAL: Could not find sched_hint TLS variable\n");
+        return 1;
+    }
 
-    printf("=== struct sched_hint ===\n");
-    printf("magic:        0x%08x %s\n", h->magic,
-           h->magic == SCHED_HINT_MAGIC ? "(OK)" : "(BAD!)");
-    printf("version:      %u\n", h->version);
-    printf("sizeof:       %zu bytes\n\n", sizeof(*h));
+    printf("\n=== struct sched_hint ===\n");
+    printf("magic:        0x%08x %s\n", g_hint->magic,
+           g_hint->magic == SCHED_HINT_MAGIC ? "(OK)" : "(BAD!)");
+    printf("version:      %u\n", g_hint->version);
+    printf("sizeof:       %zu bytes\n\n", sizeof(*g_hint));
 
-    if (h->magic != SCHED_HINT_MAGIC) {
-        printf("FATAL: bad magic — pass did not emit __sched_hint_data?\n");
+    if (g_hint->magic != SCHED_HINT_MAGIC) {
+        printf("FATAL: bad magic — pass did not emit correct data?\n");
         return 1;
     }
 
     /* Before any instrumented code runs, compute_dense should be 0. */
-    check("initial state", SCHED_COMPUTE_NONE, h->compute_dense);
+    check("initial state", SCHED_COMPUTE_NONE, g_hint->compute_dense);
 
     /*
      * workload(20, 3.14): n > 10 → int_work path → SET INT.

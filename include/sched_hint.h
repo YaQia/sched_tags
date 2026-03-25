@@ -14,9 +14,9 @@
 |* linker automatically generates the symbol __start___sched_hint for         *|
 |* convenient access.                                                         *|
 |*                                                                            *|
-|* IMPORTANT: This struct must stay ABI-stable. Only append new fields at the *|
-|* end. Never reorder or remove existing fields. Bump SCHED_HINT_VERSION when *|
-|* layout changes.                                                            *|
+|* NOTE: ABI is NOT yet stable (prototype/validation phase). The layout may   *|
+|* change between iterations. Once stabilised, only append new fields at the  *|
+|* end. Bump SCHED_HINT_VERSION when layout changes.                          *|
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
@@ -60,27 +60,6 @@ extern "C" {
 #endif
 
 /*===----------------------------------------------------------------------===*\
-|* Tag presence bitmap (tags_present / tags_active)                           *|
-|*                                                                            *|
-|* Each bit indicates whether a particular scheduling tag is present          *|
-|* (statically determined at compile time) or active (may be toggled at       *|
-|* runtime for dynamic tags).                                                 *|
-|*                                                                            *|
-|* Using uint64_t gives us 64 tag slots. Bits 0..7 are allocated below;       *|
-|* bits 8..63 are reserved for future tag types.                              *|
-\*===----------------------------------------------------------------------===*/
-
-#define SCHED_TAG_COMPUTE_DENSE  (1ULL << 0)  /* 指令特性: 计算密集          */
-#define SCHED_TAG_BRANCH_DENSE   (1ULL << 1)  /* 指令特性: 分支密集          */
-#define SCHED_TAG_MEMORY_DENSE   (1ULL << 2)  /* 指令特性: 访存密集          */
-#define SCHED_TAG_ATOMIC_DENSE   (1ULL << 3)  /* 指令特性: 原子指令密集      */
-#define SCHED_TAG_IO_DENSE       (1ULL << 4)  /* 资源需求: I/O 密集          */
-#define SCHED_TAG_UNSHARED       (1ULL << 5)  /* 资源需求: 独占资源          */
-#define SCHED_TAG_COMPUTE_PREP   (1ULL << 6)  /* 行为预测: 负载即将上升      */
-#define SCHED_TAG_DEPENDENCY     (1ULL << 7)  /* 行为预测: IPC 依赖关系      */
-/* bits 8..63: reserved for future tags                                       */
-
-/*===----------------------------------------------------------------------===*\
 |* compute-dense sub-type (bitmask, 3 bits)                                   *|
 |* Bitmask of compute types present when SCHED_TAG_COMPUTE_DENSE is set.      *|
 |* Multiple bits may be set simultaneously (e.g. INT | FLOAT).                *|
@@ -107,37 +86,56 @@ extern "C" {
 |*                                                                            *|
 |*   [0..3]    magic          — SCHED_HINT_MAGIC for validation               *|
 |*   [4..7]    version        — struct layout version                         *|
-|*   [8..15]   tags_present   — bitmap: which tags are statically set         *|
-|*   [16..23]  tags_active    — bitmap: runtime-toggleable copy (mutable)     *|
 |*                                                                            *|
 |*   --- Tag payloads (fixed offsets for kernel fast-path access) ---         *|
+|*   The scheduler checks each payload directly: non-zero = active.           *|
 |*                                                                            *|
-|*   [24]      compute_dense  — SCHED_COMPUTE_xxx sub-type                    *|
-|*   [25]      branch_dense   — 0/1                                           *|
-|*   [26]      memory_dense   — SCHED_MEMORY_xxx sub-type                     *|
-|*   [27]      atomic_dense   — 0/1 (presence flag; magic_num below)          *|
-|*   [28]      io_dense       — 0/1                                           *|
-|*   [29]      unshared       — 0/1                                           *|
-|*   [30]      compute_prep   — 0/1                                           *|
-|*   [31]      reserved_pad   — alignment padding                             *|
+|*   [8]       compute_dense  — SCHED_COMPUTE_xxx sub-type bitmask            *|
+|*   [9]       branch_dense   — 0/1                                           *|
+|*   [10]      memory_dense   — SCHED_MEMORY_xxx sub-type                     *|
+|*   [11]      atomic_dense   — 0/1                                           *|
+|*   [12]      io_dense       — 0/1                                           *|
+|*   [13]      unshared       — 0/1                                           *|
+|*   [14]      compute_prep   — 0/1                                           *|
+|*   [15]      reserved_pad   — alignment padding                             *|
 |*                                                                            *|
-|*   [32..39]  atomic_magic   — magic number for atomic co-scheduling         *|
-|*   [40..47]  dep_magic      — dependency magic number for IPC grouping      *|
-|*   [48]      dep_role       — 0 = producer, 1 = consumer                    *|
-|*   [49..55]  reserved1[7]   — future use                                    *|
+|*   --- Extended payloads ---                                                *|
 |*                                                                            *|
-|*   [56..63]  reserved2[8]   — generous padding for future tag payloads      *|
+|*   [16..23]  atomic_magic   — 64-bit bloom filter for atomic co-scheduling  *|
+|*             Encodes which base pointer addresses this thread's atomic-dense *|
+|*             region operates on (AtomicRMW / CAS only).                     *|
+|*                                                                            *|
+|*             The address is aligned to a 64-byte cache line (masked & ~63)  *|
+|*             before hashing to detect False Sharing/True Sharing contention.*|
+|*                                                                            *|
+|*             Hash:  h = (aligned_ptr) * 0x9E3779B97F4A7C15  (fibonacci)     *|
+|*             Bits:  bloom |= (1 << (h & 63))                                *|
+|*                         | (1 << ((h>>16) & 63))                            *|
+|*                         | (1 << ((h>>32) & 63))                            *|
+|*                         | (1 << ((h>>48) & 63))    (k=4 bits per ptr)      *|
+|*             Multiple pointers are OR'd together (idempotent).              *|
+|*                                                                            *|
+|*             Scheduler comparison:                                          *|
+|*               overlap = popcount(magic_a & magic_b) >= 4                   *|
+|*               → true:  threads contend on same data → co-locate            *|
+|*               → false: threads use different data   → don't interfere      *|
+|*             magic == 0 means "unknown/no info" — do NOT co-locate.         *|
+|*                                                                            *|
+|*   [24..31]  dep_magic      — dependency magic number for IPC grouping      *|
+|*   [32]      dep_role       — 0 = producer, 1 = consumer                    *|
+|*   [33..39]  reserved1[7]   — future use                                    *|
+|*                                                                            *|
+|*   [40..63]  reserved2[24]  — generous padding for future tag payloads      *|
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
 struct __attribute__((aligned(64))) sched_hint {
-    /* ---- header (24 bytes) ---- */
+    /* ---- header (8 bytes) ---- */
     uint32_t magic;             /* SCHED_HINT_MAGIC                           */
     uint32_t version;           /* SCHED_HINT_VERSION                         */
-    uint64_t tags_present;      /* bitmap: tags determined at compile time    */
-    uint64_t tags_active;       /* bitmap: runtime copy (scheduler reads this)*/
 
     /* ---- tag payloads: byte-sized for simplicity (8 bytes) ---- */
+    /* Non-zero = tag is active; the value itself encodes the sub-type.       */
     uint8_t  compute_dense;     /* SCHED_COMPUTE_xxx                          */
     uint8_t  branch_dense;      /* 0 or 1                                     */
     uint8_t  memory_dense;      /* SCHED_MEMORY_xxx                           */
@@ -148,13 +146,13 @@ struct __attribute__((aligned(64))) sched_hint {
     uint8_t  reserved_pad;      /* padding to 8-byte boundary                 */
 
     /* ---- extended payloads (24 bytes) ---- */
-    uint64_t atomic_magic;      /* shared magic for atomic co-scheduling      */
+    uint64_t atomic_magic;      /* bloom filter for atomic co-scheduling       */
     uint64_t dep_magic;         /* dependency magic for IPC grouping          */
     uint8_t  dep_role;          /* 0 = producer, 1 = consumer                 */
     uint8_t  reserved1[7];      /* future use                                 */
 
-    /* ---- reserved for future tag types (8 bytes) ---- */
-    uint8_t  reserved2[8];
+    /* ---- reserved for future tag types (24 bytes) ---- */
+    uint8_t  reserved2[24];
 };
 
 /* Compile-time size assertion: struct must be exactly 64 bytes              */
@@ -168,21 +166,26 @@ _Static_assert(sizeof(struct sched_hint) == 64,
 |* must include the TLS specifier so the linker resolves it correctly         *|
 |* (ELF symbol type STT_TLS).                                                 *|
 |*                                                                            *|
-|* In userspace:                                                              *|
-|*   extern SCHED_HINT_TLS struct sched_hint __sched_hint_data;               *|
-|*   struct sched_hint *hint = &__sched_hint_data;                            *|
+|* IMPORTANT: The actual symbol name is "__sched_hint.data" (with a period), *|
+|* which cannot be directly written in C/C++ source code. Use inline         *|
+|* assembly or the helper in test/reader_dynamic.h to access it:             *|
+|*                                                                            *|
+|* In userspace (see test/reader_dynamic.h):                                  *|
+|*   #include "reader_dynamic.h"                                              *|
+|*   struct sched_hint *hint = get_sched_hint_data();                         *|
 |*                                                                            *|
 |* In kernel space (after your ELF loader modification):                      *|
 |*   struct sched_hint *hint = current->sched_hint;                           *|
 |*   if (hint && hint->magic == SCHED_HINT_MAGIC) { ... }                     *|
 |*                                                                            *|
-|* Fast-path check example:                                                   *|
-|*   if (hint->tags_active & SCHED_TAG_COMPUTE_DENSE) {                      *|
+|* Fast-path check example (each payload is its own activity flag):           *|
+|*   if (hint->compute_dense) {                                               *|
 |*       uint8_t m = hint->compute_dense;                                     *|
-|*       if (m & SCHED_COMPUTE_INT)   { ... }                                *|
-|*       if (m & SCHED_COMPUTE_FLOAT) { ... }                                *|
-|*       if (m & SCHED_COMPUTE_SIMD)  { ... }                                *|
+|*       if (m & SCHED_COMPUTE_INT)   { ... }                                 *|
+|*       if (m & SCHED_COMPUTE_FLOAT) { ... }                                 *|
+|*       if (m & SCHED_COMPUTE_SIMD)  { ... }                                 *|
 |*   }                                                                        *|
+|*   if (hint->atomic_dense) { ... }                                          *|
 \*===----------------------------------------------------------------------===*/
 
 #ifdef __cplusplus

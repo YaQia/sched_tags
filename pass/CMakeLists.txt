@@ -4,6 +4,9 @@
 
 # Build a loadable module (.so / .dylib) for use with opt's -load-pass-plugin
 add_library(SchedTagPass MODULE
+  SchedTagCommon.cpp
+  ComputeDenseAnalysis.cpp
+  AtomicDenseAnalysis.cpp
   SchedTagPass.cpp
 )
 

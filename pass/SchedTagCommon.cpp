@@ -1,7 +1,9 @@
 #include "SchedTagCommon.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
@@ -262,6 +264,111 @@ void emitBloomMagicStore(IRBuilder<> &Builder, GlobalVariable *GV,
   Value *MagicPtr =
       Builder.CreateStructGEP(HintTy, GV, FIELD_ATOMIC_MAGIC, "hint.magic.ptr");
   Builder.CreateStore(Magic, MagicPtr);
+}
+
+//===----------------------------------------------------------------------===//
+// resolveToPreheaderValue — fix bloom-filter dominance for loop-internal ptrs
+//===----------------------------------------------------------------------===//
+
+Value *resolveToPreheaderValue(Value *V, const DominatorTree &DT,
+                               BasicBlock *InsertionPoint) {
+  // Non-instruction values (Arguments, Constants, GlobalValues) always
+  // dominate every point in the function.
+  auto *Inst = dyn_cast<Instruction>(V);
+  if (!Inst)
+    return V;
+
+  // If the instruction already dominates the insertion point, use it directly.
+  if (DT.dominates(Inst, InsertionPoint->getTerminator()))
+    return V;
+
+  // Cannot resolve — this pointer is loop-internal (e.g. a load from
+  // a data structure computed each iteration, or an initial pointer for traversal).
+  // Benchmarking shows that trying to track the initial pointer for traversals
+  // causes false sharing and degrades scheduling decisions. Skip it.
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// collectBasePointers — Extract base pointers from atomic instructions
+//===----------------------------------------------------------------------===//
+
+/// Get the pointer operand of an atomic RMW or CAS instruction.
+/// Returns nullptr for non-atomic instructions.
+static Value *getAtomicPointerOperand(Instruction &I) {
+  if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+    return RMW->getPointerOperand();
+  if (auto *CAS = dyn_cast<AtomicCmpXchgInst>(&I))
+    return CAS->getPointerOperand();
+  return nullptr;
+}
+
+/// Strip pointer casts and in-bounds GEPs to find the underlying base object.
+static Value *stripToBase(Value *Ptr) {
+  return Ptr->stripInBoundsOffsets();
+}
+
+SmallVector<Value *, 4>
+collectBasePointers(ArrayRef<BasicBlock *> BBs,
+                    const DominatorTree *DT,
+                    BasicBlock *InsertionPoint) {
+  SmallPtrSet<Value *, 4> Seen;
+  SmallVector<Value *, 4> Bases;
+
+  for (BasicBlock *BB : BBs) {
+    for (Instruction &I : *BB) {
+      Value *Ptr = getAtomicPointerOperand(I);
+      if (!Ptr)
+        continue;
+      Value *Base = stripToBase(Ptr);
+
+      // For loop-level collection, resolve to a preheader-available value.
+      if (DT && InsertionPoint) {
+        Base = resolveToPreheaderValue(Base, *DT, InsertionPoint);
+        if (!Base)
+          continue;  // Truly loop-internal — skip.
+      }
+
+      if (Seen.insert(Base).second)
+        Bases.push_back(Base);
+    }
+  }
+
+  return Bases;
+}
+
+//===----------------------------------------------------------------------===//
+// getLabelTypeFieldIndex — Map label type string to field index
+//===----------------------------------------------------------------------===//
+
+std::pair<unsigned, bool> getLabelTypeFieldIndex(StringRef LabelType) {
+  // Returns {field_index, needs_bloom_filter}
+  
+  if (LabelType == "compute-dense")
+    return {FIELD_COMPUTE_DENSE, false};
+  
+  if (LabelType == "branch-dense")
+    return {FIELD_BRANCH_DENSE, false};
+  
+  if (LabelType == "memory-dense")
+    return {FIELD_MEMORY_DENSE, false};
+  
+  if (LabelType == "atomic-dense")
+    return {FIELD_ATOMIC_DENSE, true};   // bloom filter re-enabled (dominance fix applied)
+  
+  if (LabelType == "io-dense")
+    return {FIELD_IO_DENSE, false};
+  
+  if (LabelType == "unshared")
+    return {FIELD_UNSHARED, false};
+  
+  if (LabelType == "compute-prep")
+    return {FIELD_COMPUTE_PREP, false};
+  
+  // Unknown type - print warning and use atomic_dense as fallback
+  errs() << "[SchedTag] warning: unknown label type '" << LabelType
+         << "', defaulting to atomic-dense field\n";
+  return {FIELD_ATOMIC_DENSE, false};
 }
 
 } // namespace sched_tag

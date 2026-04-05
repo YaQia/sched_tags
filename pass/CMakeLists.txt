@@ -7,6 +7,8 @@ add_library(SchedTagPass MODULE
   SchedTagCommon.cpp
   ComputeDenseAnalysis.cpp
   AtomicDenseAnalysis.cpp
+  SchedQLParser.cpp
+  SourceLabelAnalysis.cpp
   SchedTagPass.cpp
 )
 

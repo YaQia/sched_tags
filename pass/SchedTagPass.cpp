@@ -2,12 +2,32 @@
 #include "AtomicDenseAnalysis.h"
 #include "ComputeDenseAnalysis.h"
 #include "SchedTagCommon.h"
+#include "SourceLabelAnalysis.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
+
+//===----------------------------------------------------------------------===//
+// Command-line options
+//===----------------------------------------------------------------------===//
+
+static cl::opt<std::string> SchedTagsFile(
+    "sched-tags-file",
+    cl::desc("Path to sched_tags.json configuration file"),
+    cl::init("sched_tags.json"),
+    cl::Hidden);
+
+static cl::opt<bool> SchedAutoAnalysis(
+    "sched-auto-analysis",
+    cl::desc("Enable automatic static analysis (ComputeDense/AtomicDense)"),
+    cl::init(true),
+    cl::Hidden);
 
 namespace sched_tag {
 
@@ -40,6 +60,47 @@ static std::string computeMaskName(uint8_t Mask) {
 //===----------------------------------------------------------------------===//
 // Instrumentation helpers
 //===----------------------------------------------------------------------===//
+
+/// Remove regions from Plan that overlap with regions already marked by
+/// SourcePlan. This prevents duplicate instrumentation when source labels
+/// explicitly mark a region.
+///
+/// Priority: SourceLabel > AutoAnalysis (Compute/Atomic)
+static void deduplicateRegions(DensityResult &Plan,
+                                const DensityResult &SourcePlan) {
+  // Build a set of preheaders/BBs already marked by source labels
+  llvm::SmallPtrSet<llvm::BasicBlock *, 16> MarkedBBs;
+
+  // Add all loop preheaders from SourcePlan
+  for (const auto &LR : SourcePlan.Loops) {
+    if (LR.Preheader)
+      MarkedBBs.insert(LR.Preheader);
+  }
+
+  // Add all standalone BBs from SourcePlan
+  for (const auto &BR : SourcePlan.StandaloneBBs) {
+    MarkedBBs.insert(BR.BB);
+  }
+
+  if (MarkedBBs.empty())
+    return; // Nothing to deduplicate
+
+  // Filter out loops whose preheader is already marked
+  Plan.Loops.erase(
+      llvm::remove_if(Plan.Loops,
+                      [&](const LoopRegion &LR) {
+                        return LR.Preheader && MarkedBBs.count(LR.Preheader);
+                      }),
+      Plan.Loops.end());
+
+  // Filter out standalone BBs that are already marked
+  Plan.StandaloneBBs.erase(
+      llvm::remove_if(Plan.StandaloneBBs,
+                      [&](const BBRegion &BR) {
+                        return MarkedBBs.count(BR.BB);
+                      }),
+      Plan.StandaloneBBs.end());
+}
 
 /// Instrument all regions in a DensityResult by emitting SET stores.
 ///
@@ -111,22 +172,41 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
 PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
+  // ---- Load source labels from sched_tags.json ----
+  auto SourceLabels = parseSchedTagsJSON(SchedTagsFile);
+  size_t NumLabels = SourceLabels.size();
+  if (!SourceLabels.empty()) {
+    SourceLabelAnalysis::setLabels(std::move(SourceLabels));
+    errs() << "[SchedTag] loaded " << NumLabels
+           << " source label(s) from " << SchedTagsFile << "\n";
+  }
+
+  if (!SchedAutoAnalysis) {
+    errs() << "[SchedTag] auto-analysis disabled, using source labels only\n";
+  }
+
   // ---- Collect plans from all functions (read-only phase) ----
 
   struct FuncPlans {
     Function *F;
     DensityResult Compute;
     DensityResult Atomic;
+    SourceLabelResults Source;
   };
   SmallVector<FuncPlans, 8> AllPlans;
 
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
-    auto ComputePlan = FAM.getResult<ComputeDense>(F);
-    auto AtomicPlan = FAM.getResult<AtomicDense>(F);
-    if (!ComputePlan.empty() || !AtomicPlan.empty())
-      AllPlans.push_back({&F, std::move(ComputePlan), std::move(AtomicPlan)});
+    DensityResult ComputePlan, AtomicPlan;
+    if (SchedAutoAnalysis) {
+      ComputePlan = FAM.getResult<ComputeDense>(F);
+      AtomicPlan = FAM.getResult<AtomicDense>(F);
+    }
+    auto SourcePlan = FAM.getResult<SourceLabelAnalysis>(F);
+    if (!ComputePlan.empty() || !AtomicPlan.empty() || !SourcePlan.empty())
+      AllPlans.push_back({&F, std::move(ComputePlan), std::move(AtomicPlan),
+                          std::move(SourcePlan)});
   }
 
   if (AllPlans.empty()) {
@@ -138,12 +218,57 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   GlobalVariable *HintGV = getOrCreateSchedHintGV(M);
   emitPrctlConstructor(M, HintGV);
 
-  // ---- Instrument ----
-  InstrStats TotalCompute{}, TotalAtomic{};
+  // ---- Deduplicate and instrument ----
+  InstrStats TotalCompute{}, TotalAtomic{}, TotalSource{};
+  unsigned DeduplicatedLoops = 0, DeduplicatedBBs = 0;
 
-  for (auto &[FuncPtr, ComputePlan, AtomicPlan] : AllPlans) {
+  for (auto &[FuncPtr, ComputePlan, AtomicPlan, SourcePlan] : AllPlans) {
     Function &F = *FuncPtr;
 
+    // First, instrument source labels (highest priority)
+    // Process each label separately to preserve type information
+    for (const auto &SourceLabel : SourcePlan.Labels) {
+      // Get the field index and bloom filter flag for this label type
+      auto [FieldIndex, NeedsBloom] = getLabelTypeFieldIndex(SourceLabel.LabelType);
+      
+      // Make a copy to pass as non-const reference
+      DensityResult RegionsCopy = SourceLabel.Regions;
+      auto S = instrumentRegions(F, RegionsCopy, HintGV, "SOURCE",
+                                 FieldIndex, NeedsBloom);
+      TotalSource.LoopSets += S.LoopSets;
+      TotalSource.BBSets += S.BBSets;
+    }
+
+    // Build a combined DensityResult from all source labels for deduplication
+    DensityResult CombinedSourcePlan;
+    for (const auto &SourceLabel : SourcePlan.Labels) {
+      CombinedSourcePlan.Loops.append(SourceLabel.Regions.Loops.begin(),
+                                      SourceLabel.Regions.Loops.end());
+      CombinedSourcePlan.StandaloneBBs.append(
+          SourceLabel.Regions.StandaloneBBs.begin(),
+          SourceLabel.Regions.StandaloneBBs.end());
+    }
+
+    // Then deduplicate automatic analyses against source labels
+    size_t ComputeLoopsBefore = ComputePlan.Loops.size();
+    size_t ComputeBBsBefore = ComputePlan.StandaloneBBs.size();
+    size_t AtomicLoopsBefore = AtomicPlan.Loops.size();
+    size_t AtomicBBsBefore = AtomicPlan.StandaloneBBs.size();
+
+    deduplicateRegions(ComputePlan, CombinedSourcePlan);
+    deduplicateRegions(AtomicPlan, CombinedSourcePlan);
+
+    size_t ComputeLoopsAfter = ComputePlan.Loops.size();
+    size_t ComputeBBsAfter = ComputePlan.StandaloneBBs.size();
+    size_t AtomicLoopsAfter = AtomicPlan.Loops.size();
+    size_t AtomicBBsAfter = AtomicPlan.StandaloneBBs.size();
+
+    DeduplicatedLoops += (ComputeLoopsBefore - ComputeLoopsAfter) +
+                         (AtomicLoopsBefore - AtomicLoopsAfter);
+    DeduplicatedBBs += (ComputeBBsBefore - ComputeBBsAfter) +
+                       (AtomicBBsBefore - AtomicBBsAfter);
+
+    // Instrument remaining regions
     if (!ComputePlan.empty()) {
       auto S = instrumentRegions(F, ComputePlan, HintGV, "COMPUTE",
                                  FIELD_COMPUTE_DENSE, false, computeMaskName);
@@ -166,6 +291,13 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
          << TotalCompute.BBSets << " bb-SET\n";
   errs() << "[SchedTag]   atomic:  " << TotalAtomic.LoopSets << " loop-SET, "
          << TotalAtomic.BBSets << " bb-SET\n";
+  errs() << "[SchedTag]   source:  " << TotalSource.LoopSets << " loop-SET, "
+         << TotalSource.BBSets << " bb-SET\n";
+  if (DeduplicatedLoops > 0 || DeduplicatedBBs > 0) {
+    errs() << "[SchedTag]   deduplicated: " << DeduplicatedLoops
+           << " loops, " << DeduplicatedBBs
+           << " BBs (source labels take priority)\n";
+  }
 
   return PreservedAnalyses::none();
 }
@@ -201,11 +333,12 @@ llvm::PassPluginLibraryInfo getSchedTagPluginInfo() {
                 MPM.addPass(sched_tag::SchedTagPass());
             });
 
-            // Register both per-function analyses.
+            // Register all per-function analyses.
             PB.registerAnalysisRegistrationCallback(
                 [](FunctionAnalysisManager &FAM) {
                   FAM.registerPass([&] { return sched_tag::ComputeDense(); });
                   FAM.registerPass([&] { return sched_tag::AtomicDense(); });
+                  FAM.registerPass([&] { return sched_tag::SourceLabelAnalysis(); });
                 });
           }};
 }

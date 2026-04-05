@@ -3,6 +3,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PatternMatch.h"
 
@@ -48,45 +49,7 @@ bool isAtomicOp(const Instruction &I) {
   return isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I);
 }
 
-//===----------------------------------------------------------------------===//
-// Base pointer extraction
-//===----------------------------------------------------------------------===//
-
-/// Get the pointer operand of an atomic RMW or CAS instruction.
-/// Returns nullptr for non-atomic instructions.
-static Value *getAtomicPointerOperand(Instruction &I) {
-  if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
-    return RMW->getPointerOperand();
-  if (auto *CAS = dyn_cast<AtomicCmpXchgInst>(&I))
-    return CAS->getPointerOperand();
-  return nullptr;
-}
-
-/// Strip pointer casts and in-bounds GEPs to find the underlying base object.
-/// This groups operations on different fields of the same struct together.
-static Value *stripToBase(Value *Ptr) {
-  return Ptr->stripInBoundsOffsets();
-}
-
-/// Collect unique base pointers from all atomic RMW/CAS instructions in a
-/// set of basic blocks.  Results are deduplicated by SSA Value identity.
-static SmallVector<Value *, 4> collectBasePointers(ArrayRef<BasicBlock *> BBs) {
-  SmallPtrSet<Value *, 4> Seen;
-  SmallVector<Value *, 4> Bases;
-
-  for (BasicBlock *BB : BBs) {
-    for (Instruction &I : *BB) {
-      Value *Ptr = getAtomicPointerOperand(I);
-      if (!Ptr)
-        continue;
-      Value *Base = stripToBase(Ptr);
-      if (Seen.insert(Base).second)
-        Bases.push_back(Base);
-    }
-  }
-
-  return Bases;
-}
+// Note: collectBasePointers is now in SchedTagCommon.cpp
 
 //===----------------------------------------------------------------------===//
 // CAS Retry Loop Pattern Detection
@@ -226,6 +189,7 @@ AtomicDense::Result AtomicDense::run(Function &F,
   //--- Step 2: Loop-level analysis (outermost-first) -----------------------
 
   auto &LI = FAM.getResult<LoopAnalysis>(F);
+  auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
   DenseSet<BasicBlock *> CoveredByLoop;
 
@@ -296,9 +260,11 @@ AtomicDense::Result AtomicDense::run(Function &F,
     }
 
     // Collect base pointers for bloom-filter magic computation.
+    // Use dominance-aware collection: pointers defined inside the loop
+    // (e.g. PHI nodes) are resolved to their preheader incoming value.
     SmallVector<BasicBlock *, 8> LoopBBs(L->getBlocks().begin(),
                                           L->getBlocks().end());
-    LR.BasePointers = collectBasePointers(LoopBBs);
+    LR.BasePointers = collectBasePointers(LoopBBs, &DT, Preheader);
 
     Plan.Loops.push_back(std::move(LR));
 

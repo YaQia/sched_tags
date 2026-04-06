@@ -8,12 +8,29 @@
         {
             "type": "<label-type>",
             "query": "<schedql-query>",
-            "value": "<label-value>"
+            "value": "<label-value>",
+            "magic_vars": ["<var-name1>", "<var-name2>"],
             "comment": "<human-readable explanation>"
         }
     ]
 }
 ```
+
+### 字段说明
+| 字段 | 必需 | 描述 |
+|------|------|------|
+| `type` | 是 | 标签类型 |
+| `query` | 是 | SchedQL 查询语句，定位代码区域 |
+| `value` | 否 | 标签值（默认 1） |
+| `magic_vars` | 否 | 变量名数组，用于 bloom filter 计算（适用于 `atomic-dense` 和 `unshared`） |
+| `comment` | 否 | 人类可读的说明 |
+
+### magic_vars 字段
+对于需要 bloom filter 的标签类型（`atomic-dense`、`unshared`），`magic_vars` 指定哪些变量的地址应被追踪：
+- 如果指定了 `magic_vars`，Pass 会在匹配区域内查找这些变量名对应的 SSA 值
+- 如果未指定，Pass 会自动检测区域内的原子操作（`atomicrmw`/`cmpxchg`）并提取其指针
+- 支持的变量来源：函数参数、全局变量、局部指令（如 `alloca`）
+
 ## 支持的标签类型
 ### 1. 指令特性标签
 | 标签类型 | 使用场景 | 值 | 调度目标 |

@@ -106,8 +106,9 @@ static void deduplicateRegions(DensityResult &Plan,
 ///
 /// @p TagName        — human-readable tag name for diagnostics
 /// @p FieldIdx       — struct field index for the tag payload
-/// @p EmitBloomMagic — if true, also emit bloom-filter hash stores to
-///                     atomic_magic using each region's BasePointers
+/// @p EmitBloomMagic — if true, also emit bloom-filter hash stores using
+///                     each region's BasePointers (atomic_magic or unshared_magic
+///                     depending on FieldIdx)
 /// @p NameFn         — optional callback to pretty-print the TypeMask
 ///
 /// Returns the number of SET stores inserted.
@@ -126,6 +127,11 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
 
   InstrStats Stats;
 
+  // Determine which magic field to use based on tag type
+  unsigned MagicFieldIdx = (FieldIdx == FIELD_UNSHARED) 
+                           ? FIELD_UNSHARED_MAGIC 
+                           : FIELD_ATOMIC_MAGIC;
+
   // --- Loop-level instrumentation ---
   for (auto &LR : Plan.Loops) {
     // SET before the branch into the loop header.
@@ -133,7 +139,7 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
       IRBuilder<> Builder(LR.Preheader->getTerminator());
       emitFieldStore(Builder, HintGV, FieldIdx, LR.TypeMask);
       if (EmitBloomMagic)
-        emitBloomMagicStore(Builder, HintGV, LR.BasePointers);
+        emitBloomMagicStore(Builder, HintGV, LR.BasePointers, MagicFieldIdx);
     }
     Stats.LoopSets++;
 
@@ -151,7 +157,7 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
       IRBuilder<> Builder(&*BR.BB->getFirstNonPHIOrDbg());
       emitFieldStore(Builder, HintGV, FieldIdx, BR.TypeMask);
       if (EmitBloomMagic)
-        emitBloomMagicStore(Builder, HintGV, BR.BasePointers);
+        emitBloomMagicStore(Builder, HintGV, BR.BasePointers, MagicFieldIdx);
     }
     Stats.BBSets++;
 
@@ -271,7 +277,8 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
     // Instrument remaining regions
     if (!ComputePlan.empty()) {
       auto S = instrumentRegions(F, ComputePlan, HintGV, "COMPUTE",
-                                 FIELD_COMPUTE_DENSE, false, computeMaskName);
+                                 FIELD_COMPUTE_DENSE, /*EmitBloomMagic=*/false,
+                                 computeMaskName);
       TotalCompute.LoopSets += S.LoopSets;
       TotalCompute.BBSets += S.BBSets;
     }

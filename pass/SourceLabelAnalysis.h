@@ -28,6 +28,11 @@ struct SourceLabel {
                               // - For memory-dense: STREAM(1) or RANDOM(2)
                               // - For boolean fields: 1 (or 0 to disable)
                               // Default: 1
+  llvm::SmallVector<std::string, 4> MagicVars;  // Variable names for bloom filter
+                              // If non-empty, Pass will search for these variable
+                              // names in the matched region and use their addresses
+                              // for bloom filter computation (atomic_magic/unshared_magic).
+                              // If empty, falls back to automatic detection (atomic ops).
 };
 
 //===----------------------------------------------------------------------===//
@@ -76,9 +81,12 @@ private:
 /// Execute a SchedQL query on a function.
 /// Returns a DensityResult containing matching instructions/regions.
 /// TypeMask is the value to store in the tag field (from label's "value" field).
+/// MagicVars specifies variable names to search for bloom filter computation.
+/// If MagicVars is empty, falls back to automatic detection of atomic operations.
 DensityResult executeQuery(llvm::Function &F, const Query &Q,
                            llvm::FunctionAnalysisManager &AM,
-                           uint8_t TypeMask);
+                           uint8_t TypeMask,
+                           llvm::ArrayRef<std::string> MagicVars = {});
 
 //===----------------------------------------------------------------------===//
 // JSON parsing

@@ -38,9 +38,9 @@ StructType *getSchedHintType(LLVMContext &Ctx) {
                               I8,                     //  [9] reserved_pad
                               I64,                    // [10] atomic_magic
                               I64,                    // [11] dep_magic
-                              I8,                     // [12] dep_role
-                              ArrayType::get(I8, 7),  // [13] reserved1[7]
-                              ArrayType::get(I8, 24), // [14] reserved2[24]
+                              I64,                    // [12] unshared_magic
+                              I8,                     // [13] dep_role
+                              ArrayType::get(I8, 23), // [14] reserved[23]
                           },
                           "struct.sched_hint",
                           /*isPacked=*/false);
@@ -81,9 +81,9 @@ GlobalVariable *getOrCreateSchedHintGV(Module &M) {
                   ConstantInt::get(I8, 0),                  // reserved_pad
                   ConstantInt::get(I64, 0),                 // atomic_magic
                   ConstantInt::get(I64, 0),                 // dep_magic
+                  ConstantInt::get(I64, 0),                 // unshared_magic
                   ConstantInt::get(I8, 0),                  // dep_role
-                  ConstantAggregateZero::get(ArrayType::get(I8, 7)),  // reserved1
-                  ConstantAggregateZero::get(ArrayType::get(I8, 24)), // reserved2
+                  ConstantAggregateZero::get(ArrayType::get(I8, 23)), // reserved
               });
 
   // Check if a global with this name already exists
@@ -244,7 +244,8 @@ static Value *emitBloomBits(IRBuilder<> &Builder, Value *PtrVal) {
 }
 
 void emitBloomMagicStore(IRBuilder<> &Builder, GlobalVariable *GV,
-                         ArrayRef<Value *> BasePointers) {
+                         ArrayRef<Value *> BasePointers,
+                         unsigned FieldIdx) {
   LLVMContext &Ctx = Builder.getContext();
   auto *I64 = Type::getInt64Ty(Ctx);
   StructType *HintTy = getSchedHintType(Ctx);
@@ -262,7 +263,7 @@ void emitBloomMagicStore(IRBuilder<> &Builder, GlobalVariable *GV,
   }
 
   Value *MagicPtr =
-      Builder.CreateStructGEP(HintTy, GV, FIELD_ATOMIC_MAGIC, "hint.magic.ptr");
+      Builder.CreateStructGEP(HintTy, GV, FieldIdx, "hint.magic.ptr");
   Builder.CreateStore(Magic, MagicPtr);
 }
 
@@ -354,13 +355,13 @@ std::pair<unsigned, bool> getLabelTypeFieldIndex(StringRef LabelType) {
     return {FIELD_MEMORY_DENSE, false};
   
   if (LabelType == "atomic-dense")
-    return {FIELD_ATOMIC_DENSE, true};   // bloom filter re-enabled (dominance fix applied)
+    return {FIELD_ATOMIC_DENSE, true};   // bloom filter for atomic_magic
   
   if (LabelType == "io-dense")
     return {FIELD_IO_DENSE, false};
   
   if (LabelType == "unshared")
-    return {FIELD_UNSHARED, false};
+    return {FIELD_UNSHARED, true};       // bloom filter for unshared_magic
   
   if (LabelType == "compute-prep")
     return {FIELD_COMPUTE_PREP, false};

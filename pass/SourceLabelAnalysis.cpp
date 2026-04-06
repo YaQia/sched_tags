@@ -63,8 +63,9 @@ SourceLabelResults SourceLabelAnalysis::run(Function &F,
       errs() << "[SourceLabel] warning: signature checking not yet implemented\n";
     }
 
-    // Execute query with the label's value
-    auto MatchResult = executeQuery(F, Label.QueryAST, AM, Label.Value);
+    // Execute query with the label's value and magic_vars
+    auto MatchResult = executeQuery(F, Label.QueryAST, AM, Label.Value,
+                                    Label.MagicVars);
 
     if (!MatchResult.empty()) {
       errs() << "[SourceLabel] matched query in " << F.getName() << ": type="
@@ -228,12 +229,99 @@ static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
 // Note: extractBasePointers is removed - we now use collectBasePointers from SchedTagCommon.
 
 //===----------------------------------------------------------------------===//
+// Magic variable lookup
+//===----------------------------------------------------------------------===//
+
+/// Find SSA values by name within a set of basic blocks.
+/// Searches for:
+///   1. Instructions with matching names (e.g., %mutex_ptr)
+///   2. Function arguments with matching names
+///   3. Global variables with matching names
+/// Returns a vector of pointer-typed values for bloom filter computation.
+static SmallVector<Value *, 4>
+findValuesByName(ArrayRef<BasicBlock *> BBs, ArrayRef<std::string> VarNames,
+                 Function &F) {
+  SmallPtrSet<Value *, 4> Seen;
+  SmallVector<Value *, 4> Results;
+
+  // Helper to add a value if it's pointer-typed and not already seen
+  auto TryAdd = [&](Value *V) {
+    if (!V || !V->getType()->isPointerTy())
+      return;
+    if (Seen.insert(V).second)
+      Results.push_back(V);
+  };
+
+  for (const std::string &Name : VarNames) {
+    StringRef NameRef(Name);
+
+    // 1. Search function arguments
+    for (Argument &Arg : F.args()) {
+      if (Arg.getName() == NameRef) {
+        TryAdd(&Arg);
+      }
+    }
+
+    // 2. Search global variables
+    if (GlobalVariable *GV = F.getParent()->getGlobalVariable(Name)) {
+      TryAdd(GV);
+    }
+
+    // 3. Search instructions in the specified BBs
+    for (BasicBlock *BB : BBs) {
+      for (Instruction &I : *BB) {
+        if (I.getName() == NameRef) {
+          TryAdd(&I);
+        }
+        // Also check if any operand is a named value we're looking for
+        // (useful for finding alloca'd variables used in loads/stores)
+        for (Use &U : I.operands()) {
+          if (U->getName() == NameRef) {
+            TryAdd(U.get());
+          }
+        }
+      }
+    }
+  }
+
+  return Results;
+}
+
+/// Collect base pointers based on magic_vars or fallback to automatic detection.
+/// If MagicVars is non-empty, searches for named variables.
+/// Otherwise, falls back to collectBasePointers (automatic atomic op detection).
+static SmallVector<Value *, 4>
+collectMagicPointers(ArrayRef<BasicBlock *> BBs,
+                     ArrayRef<std::string> MagicVars,
+                     Function &F,
+                     const DominatorTree *DT = nullptr,
+                     BasicBlock *InsertionPoint = nullptr) {
+  if (!MagicVars.empty()) {
+    // Use explicit variable names
+    auto Ptrs = findValuesByName(BBs, MagicVars, F);
+    if (Ptrs.empty()) {
+      errs() << "[SourceLabel] warning: no values found for magic_vars [";
+      for (size_t i = 0; i < MagicVars.size(); ++i) {
+        if (i > 0) errs() << ", ";
+        errs() << MagicVars[i];
+      }
+      errs() << "], falling back to automatic detection\n";
+      return collectBasePointers(BBs, DT, InsertionPoint);
+    }
+    return Ptrs;
+  }
+  // Fallback: automatic detection of atomic operations
+  return collectBasePointers(BBs, DT, InsertionPoint);
+}
+
+//===----------------------------------------------------------------------===//
 // Query execution
 //===----------------------------------------------------------------------===//
 
 DensityResult executeQuery(Function &F, const Query &Q,
                            FunctionAnalysisManager &AM,
-                           uint8_t TypeMask) {
+                           uint8_t TypeMask,
+                           ArrayRef<std::string> MagicVars) {
   DensityResult Result;
 
   // Get LoopInfo and DominatorTree if we need them
@@ -247,8 +335,8 @@ DensityResult executeQuery(Function &F, const Query &Q,
   // Handle loop-based queries
   // Simplified: loop[contains=X] is sufficient; trailing /instr is optional
   // and only serves as an additional filter (not for positioning).
-  // Base pointers for bloom filter are automatically collected from all
-  // atomic RMW/CAS instructions in the loop.
+  // Base pointers for bloom filter are collected from magic_vars if specified,
+  // otherwise falls back to automatic atomic op detection.
   if (Q.Tgt.Loop.has_value()) {
     auto Loops = findMatchingLoops(*LI, *Q.Tgt.Loop);
 
@@ -264,15 +352,12 @@ DensityResult executeQuery(Function &F, const Query &Q,
 
       // Loop matching is based on contains= patterns in findMatchingLoops().
       // The trailing /instr query (if any) is now ignored for loop-level labels.
-      // Base pointers for bloom filter are automatically collected from all
-      // atomic RMW/CAS instructions in the loop.
 
       LR.TypeMask = TypeMask;
       
-      // Collect base pointers from ALL atomic operations in the loop
-      // (using the shared utility from SchedTagCommon).
+      // Collect base pointers using magic_vars or fallback to automatic detection
       SmallVector<BasicBlock *, 8> LoopBBs(L->blocks().begin(), L->blocks().end());
-      LR.BasePointers = collectBasePointers(LoopBBs, DT, LR.Preheader);
+      LR.BasePointers = collectMagicPointers(LoopBBs, MagicVars, F, DT, LR.Preheader);
       
       Result.Loops.push_back(LR);
 
@@ -315,9 +400,10 @@ DensityResult executeQuery(Function &F, const Query &Q,
       BBRegion BR;
       BR.BB = TargetBB;
       BR.TypeMask = TypeMask;
-      // Collect base pointers from this single BB
+      // Collect base pointers using magic_vars or fallback
       BasicBlock *BBPtr = TargetBB;
-      BR.BasePointers = collectBasePointers(ArrayRef<BasicBlock *>(&BBPtr, 1));
+      BR.BasePointers = collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1),
+                                              MagicVars, F);
       Result.StandaloneBBs.push_back(BR);
 
       errs() << "[SourceLabel] matched BB " << TargetBB->getName()
@@ -335,9 +421,10 @@ DensityResult executeQuery(Function &F, const Query &Q,
       BBRegion BR;
       BR.BB = &BB;
       BR.TypeMask = TypeMask;
-      // Collect base pointers from this single BB
+      // Collect base pointers using magic_vars or fallback
       BasicBlock *BBPtr = &BB;
-      BR.BasePointers = collectBasePointers(ArrayRef<BasicBlock *>(&BBPtr, 1));
+      BR.BasePointers = collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1),
+                                              MagicVars, F);
       Result.StandaloneBBs.push_back(BR);
 
       errs() << "[SourceLabel] found " << Matches.size()
@@ -434,11 +521,30 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
     L.Type = Type->str();
     L.QueryAST = *QueryAST;
     L.Value = Value;
+    
+    // Parse magic_vars array (optional)
+    if (const json::Array *MagicVarsArray = LabelObj->getArray("magic_vars")) {
+      for (const auto &VarVal : *MagicVarsArray) {
+        if (auto VarStr = VarVal.getAsString()) {
+          L.MagicVars.push_back(VarStr->str());
+        }
+      }
+    }
+    
     Labels.push_back(L);
 
     errs() << "[SourceLabel] loaded label: type=" << L.Type
            << ", func=" << L.QueryAST.Function.Name
-           << ", value=" << (int)L.Value << "\n";
+           << ", value=" << (int)L.Value;
+    if (!L.MagicVars.empty()) {
+      errs() << ", magic_vars=[";
+      for (size_t i = 0; i < L.MagicVars.size(); ++i) {
+        if (i > 0) errs() << ", ";
+        errs() << L.MagicVars[i];
+      }
+      errs() << "]";
+    }
+    errs() << "\n";
   }
 
   return Labels;

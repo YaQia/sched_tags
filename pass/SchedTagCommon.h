@@ -45,7 +45,10 @@ static constexpr unsigned FIELD_IO_DENSE = 6;      // offset 12 (i8)
 static constexpr unsigned FIELD_UNSHARED = 7;      // offset 13 (i8)
 static constexpr unsigned FIELD_COMPUTE_PREP = 8;  // offset 14 (i8)
 // Extended payloads:
-static constexpr unsigned FIELD_ATOMIC_MAGIC = 10; // offset 16 (i64)
+static constexpr unsigned FIELD_ATOMIC_MAGIC = 10;   // offset 16 (i64)
+static constexpr unsigned FIELD_DEP_MAGIC = 11;      // offset 24 (i64)
+static constexpr unsigned FIELD_UNSHARED_MAGIC = 12; // offset 32 (i64)
+static constexpr unsigned FIELD_DEP_ROLE = 13;       // offset 40 (i8)
 
 // Bloom filter parameters for atomic_magic (register-width bloom filter).
 // Each pointer address sets K_BLOOM_BITS bit-positions in a 64-bit word.
@@ -121,14 +124,16 @@ void emitFieldStore(llvm::IRBuilder<> &Builder, llvm::GlobalVariable *GV,
 
 
 /// Emit a bloom-filter hash of the given base pointers and store the result
-/// into the atomic_magic field (i64).  Each pointer is hashed to K_BLOOM_BITS
+/// into the specified magic field (i64).  Each pointer is hashed to K_BLOOM_BITS
 /// bit-positions in a 64-bit word; results are OR'd together (idempotent).
 ///
-/// If BasePointers is empty, stores 0 (unknown — scheduler should not
-/// co-locate).
+/// @p FieldIdx — target field index (FIELD_ATOMIC_MAGIC or FIELD_UNSHARED_MAGIC)
+///
+/// If BasePointers is empty, stores 0 (unknown — scheduler should not co-locate).
 void emitBloomMagicStore(::llvm::IRBuilder<> &Builder,
                          ::llvm::GlobalVariable *GV,
-                         ::llvm::ArrayRef<::llvm::Value *> BasePointers);
+                         ::llvm::ArrayRef<::llvm::Value *> BasePointers,
+                         unsigned FieldIdx = FIELD_ATOMIC_MAGIC);
 
 /// Resolve a Value to one that dominates the given InsertionPoint.
 ///

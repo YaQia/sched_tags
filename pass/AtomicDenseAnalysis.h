@@ -35,7 +35,7 @@ bool isAtomicOp(const llvm::Instruction &I);
 //===----------------------------------------------------------------------===//
 
 /// Produces a DensityResult describing all atomic-dense loops and BBs.
-/// TypeMask in the result is always 1 (atomic_dense is a boolean field).
+/// Value in the result is always 1 (atomic_dense is a boolean field).
 struct AtomicDense : public llvm::AnalysisInfoMixin<AtomicDense> {
 public:
   using Result = DensityResult;

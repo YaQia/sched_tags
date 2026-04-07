@@ -115,7 +115,7 @@ static void deduplicateRegions(DensityResult &Plan,
 /// @p EmitBloomMagic — if true, also emit bloom-filter hash stores using
 ///                     each region's BasePointers (atomic_magic or unshared_magic
 ///                     depending on FieldIdx)
-/// @p NameFn         — optional callback to pretty-print the TypeMask
+/// @p NameFn         — optional callback to pretty-print the Value
 ///
 /// Returns the number of SET stores inserted.
 /// Note: For LoopRegion and BBRegion, tag clearing is handled by the kernel 
@@ -145,14 +145,19 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     // SET before the branch into the loop header.
     {
       IRBuilder<> Builder(LR.Preheader->getTerminator());
-      emitFieldStore(Builder, HintGV, FieldIdx, LR.TypeMask);
-      if (EmitBloomMagic)
-        emitBloomMagicStore(Builder, HintGV, LR.BasePointers, MagicFieldIdx);
+      emitFieldStore(Builder, HintGV, FieldIdx, LR.Value);
+      if (EmitBloomMagic) {
+        if (LR.StaticMagic.has_value()) {
+          emitFieldStore(Builder, HintGV, MagicFieldIdx, *LR.StaticMagic);
+        } else {
+          emitBloomMagicStore(Builder, HintGV, LR.BasePointers, MagicFieldIdx);
+        }
+      }
     }
     Stats.LoopSets++;
 
     std::string ValStr =
-        NameFn ? NameFn(LR.TypeMask) : std::to_string(LR.TypeMask);
+        NameFn ? NameFn(LR.Value) : std::to_string(LR.Value);
     errs() << "[SchedTag]   LOOP SET  " << F.getName() << "::preheader("
            << LR.Preheader->getName() << ") -> " << TagName << " " << ValStr
            << " (bases=" << LR.BasePointers.size() << ")\n";
@@ -163,14 +168,19 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     // SET at BB entry (after PHI nodes).
     {
       IRBuilder<> Builder(&*BR.BB->getFirstNonPHIOrDbg());
-      emitFieldStore(Builder, HintGV, FieldIdx, BR.TypeMask);
-      if (EmitBloomMagic)
-        emitBloomMagicStore(Builder, HintGV, BR.BasePointers, MagicFieldIdx);
+      emitFieldStore(Builder, HintGV, FieldIdx, BR.Value);
+      if (EmitBloomMagic) {
+        if (BR.StaticMagic.has_value()) {
+          emitFieldStore(Builder, HintGV, MagicFieldIdx, *BR.StaticMagic);
+        } else {
+          emitBloomMagicStore(Builder, HintGV, BR.BasePointers, MagicFieldIdx);
+        }
+      }
     }
     Stats.BBSets++;
 
     std::string ValStr =
-        NameFn ? NameFn(BR.TypeMask) : std::to_string(BR.TypeMask);
+        NameFn ? NameFn(BR.Value) : std::to_string(BR.Value);
     errs() << "[SchedTag]   BB   SET  " << F.getName()
            << "::" << BR.BB->getName() << " -> " << TagName << " " << ValStr
            << " (bases=" << BR.BasePointers.size() << ")\n";
@@ -184,9 +194,14 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     // SET before StartInst
     {
       IRBuilder<> Builder(RR.StartInst);
-      emitFieldStore(Builder, HintGV, FieldIdx, RR.TypeMask);
-      if (EmitBloomMagic)
-        emitBloomMagicStore(Builder, HintGV, RR.BasePointers, MagicFieldIdx);
+      emitFieldStore(Builder, HintGV, FieldIdx, RR.Value);
+      if (EmitBloomMagic) {
+        if (RR.StaticMagic.has_value()) {
+          emitFieldStore(Builder, HintGV, MagicFieldIdx, *RR.StaticMagic);
+        } else {
+          emitBloomMagicStore(Builder, HintGV, RR.BasePointers, MagicFieldIdx);
+        }
+      }
     }
     
     // CLR after EndInst (store 0 to clear the tag)
@@ -198,7 +213,11 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
         emitFieldStore(Builder, HintGV, FieldIdx, 0);  // Clear tag
         if (EmitBloomMagic) {
           // Clear magic field too
-          emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);  // Empty = 0
+          if (RR.StaticMagic.has_value()) {
+            emitFieldStore(Builder, HintGV, MagicFieldIdx, 0); // Clear static magic
+          } else {
+            emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);  // Empty = 0
+          }
         }
       } else {
         // EndInst is terminator, insert before it
@@ -210,7 +229,7 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     Stats.RangedSets++;
 
     std::string ValStr =
-        NameFn ? NameFn(RR.TypeMask) : std::to_string(RR.TypeMask);
+        NameFn ? NameFn(RR.Value) : std::to_string(RR.Value);
     errs() << "[SchedTag]   RANGE SET/CLR  " << F.getName()
            << "::" << RR.StartInst->getParent()->getName() << "/"
            << RR.StartInst->getOpcodeName() << " → "
@@ -295,6 +314,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
                                  FieldIndex, NeedsBloom);
       TotalSource.LoopSets += S.LoopSets;
       TotalSource.BBSets += S.BBSets;
+      TotalSource.RangedSets += S.RangedSets;
     }
 
     // Build a combined DensityResult from all source labels for deduplication

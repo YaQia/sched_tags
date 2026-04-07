@@ -21,8 +21,8 @@
 |------|------|------|
 | `type` | 是 | 标签类型 |
 | `query` | 是 | SchedQL 查询语句，支持字符串或对象形式（见下文） |
-| `value` | 否 | 标签值（默认 1） |
-| `magic_vars` | 否 | 变量名数组，用于 bloom filter 计算（适用于 `atomic-dense` 和 `unshared`） |
+| `value` | 否 | 标签值（默认 1）。对于 `unshared` 和 `atomic-dense`，如果提供整数，将作为跨进程唯一的静态魔数 (Static Magic Number)。 |
+| `magic_vars` | 否 | 变量名数组，用于 bloom filter 计算（适用于 `atomic-dense` 和 `unshared`，与静态魔数互斥） |
 | `comment` | 否 | 人类可读的说明 |
 
 ### query 字段格式
@@ -97,6 +97,9 @@
 - 如果未指定，Pass 会自动检测区域内的原子操作（`atomicrmw`/`cmpxchg`）并提取其指针
 - 支持的变量来源：函数参数、全局变量、局部指令（如 `alloca`）
 
+> **跨进程同步的注意事项：**
+> 如果遇到跨进程锁（如 System V 信号量、文件锁、跨进程 Mutex），使用 `magic_vars` 获取虚拟地址在不同进程间会失效。此时**请勿使用 `magic_vars`**，而是在 `value` 字段直接填入一个全局唯一的 64 位整数作为静态魔数（Static Magic Number），Pass 将跳过 Bloom Filter 计算，直接使用该常量标识这个独占资源。
+
 ## 支持的标签类型
 ### 1. 指令特性标签
 | 标签类型 | 使用场景 | 值 | 调度目标 |
@@ -151,11 +154,16 @@ Target ::= LoopQuery
         | InstructionQuery
 (* 循环查询 *)
 LoopQuery ::= "loop" "[" PatternList "]"
-(* 基本块查询 *)
-BasicBlockQuery ::= "bb" BlockSpec
-BlockSpec ::=  Identifier                 (* 标签名 *)
-           |   "entry"                    (* 入口块 *)
-           |   "exit"                     (* 退出块 *)
+(* 基本块查询 - 与 LoopQuery 对齐的统一语法 *)
+BasicBlockQuery ::= "bb" "[" BBPatternList "]"
+BBPatternList ::= BBPattern (";" BBPattern)*
+BBPattern ::= "entry"                      (* 入口块 *)
+           | "exit"                        (* 退出块，含 ret 指令 *)
+           | "name" "=" Identifier         (* 按标签名匹配 *)
+           | BBCategory "=" TypeSpec       (* 按指令类型匹配 *)
+BBCategory ::= "contains"                  (* 包含该类型指令 *)
+            | "in"                         (* 被该类型指令支配 *)
+            | "not_in"                     (* 不被该类型指令支配 *)
 (* 指令查询 *)
 InstructionQuery ::= InstructionType "[" PredicateList "]"
 (* Pattern列表 *)
@@ -200,19 +208,31 @@ Number ::= [0-9]+
 ### 常见模式
 1. **定位循环中的原子操作**（用于自旋锁、无锁数据结构）：
 ```
-@lockfree::Stack::push/loop[contains=cmpxchg]/cmpxchg[first]
+@lockfree::Stack::push/loop[contains=cmpxchg]
 ```
 2. **定位循环中的计算密集操作**：
 ```
-@matrix_multiply/loop[contains=fmul]/fmul[first]
+@matrix_multiply/loop[contains=fmul]
 ```
-3. **定位函数入口**：
+3. **定位函数入口块**：
 ```
-@critical_function/bb entry/call[first]
+@critical_function/bb[entry]
 ```
-4. **定位特定基本块中的指令**：
+4. **定位特定名称的基本块**：
 ```
-@my_function/bb block_name/load[first]
+@my_function/bb[name=error_handler]
+```
+5. **定位包含特定指令的基本块**：
+```
+@my_function/bb[contains=atomicrmw]
+```
+6. **组合多个 BB 模式**（entry 块且包含 call 指令）：
+```
+@my_function/bb[entry;contains=call]
+```
+7. **定位特定函数调用**：
+```
+@worker_thread/call[func=pthread_mutex_lock]
 ```
 ### 支持的指令类型
 - 原子操作：`cmpxchg`, `atomicrmw`

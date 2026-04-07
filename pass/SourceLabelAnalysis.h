@@ -32,6 +32,7 @@ struct SourceLabel {
                               // - For memory-dense: STREAM(1) or RANDOM(2)
                               // - For boolean fields: 1 (or 0 to disable)
                               // Default: 1
+  std::optional<uint64_t> StaticMagic; // Hardcoded magic number (overrides bloom filter)
   llvm::SmallVector<std::string, 4> MagicVars;  // Variable names for bloom filter
                               // If non-empty, Pass will search for these variable
                               // names in the matched region and use their addresses
@@ -89,24 +90,26 @@ private:
 // Query execution
 //===----------------------------------------------------------------------===//
 
-/// Execute a SchedQL query on a function (single query form).
-/// Returns a DensityResult containing matching instructions/regions.
-/// TypeMask is the value to store in the tag field (from label's "value" field).
-/// MagicVars specifies variable names to search for bloom filter computation.
-/// If MagicVars is empty, falls back to automatic detection of atomic operations.
-DensityResult executeQuery(llvm::Function &F, const Query &Q,
-                           llvm::FunctionAnalysisManager &AM,
-                           uint8_t TypeMask,
-                           llvm::ArrayRef<std::string> MagicVars = {});
+/// Check if a label type requires bloom filter (base pointers).
+/// Only atomic-dense and unshared need magic pointers.
+inline bool labelNeedsBloomFilter(llvm::StringRef Type) {
+  return Type == "atomic-dense" || Type == "unshared";
+}
 
-/// Execute a SchedQL ranged query on a function (start/end pair).
-/// Returns a DensityResult containing RangedRegions for precise range labeling.
+/// Execute a ranged query (start/end pair) for precise range labeling.
 /// Used for labels like "unshared" where the scheduler needs exact boundaries.
-DensityResult executeQuery(llvm::Function &F,
-                           std::pair<const Query &, const Query &> StartEnd,
-                           llvm::FunctionAnalysisManager &AM,
-                           uint8_t TypeMask,
-                           llvm::ArrayRef<std::string> MagicVars = {});
+DensityResult executeQueryRange(llvm::Function &F, const SourceLabel &Label);
+
+/// Execute a loop-based query.
+/// Finds all matching loops and instruments them.
+DensityResult executeQueryLoop(llvm::Function &F, const SourceLabel &Label,
+                               llvm::FunctionAnalysisManager &AM);
+
+/// Execute a basic block query.
+DensityResult executeQueryBB(llvm::Function &F, const SourceLabel &Label);
+
+/// Execute a direct instruction query (BB-level labeling based on instruction presence).
+DensityResult executeQueryInstruction(llvm::Function &F, const SourceLabel &Label);
 
 //===----------------------------------------------------------------------===//
 // JSON parsing

@@ -231,7 +231,7 @@ ComputeDense::Result ComputeDense::run(Function &F,
 
     LoopRegion LR;
     LR.Preheader = Preheader;
-    LR.TypeMask = LoopMask;
+    LR.Value = LoopMask;
 
     // Get deduplicated exit blocks directly using LLVM's built-in method
     L->getUniqueExitBlocks(LR.ExitBlocks);

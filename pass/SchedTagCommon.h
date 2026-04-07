@@ -66,7 +66,8 @@ struct LoopRegion {
   llvm::BasicBlock *Preheader; // SET here
   llvm::SmallVector<llvm::BasicBlock *, 4>
       ExitBlocks;   // (unused; CLR now handled by kernel scheduler)
-  uint8_t TypeMask; // value to store in the tag payload field
+  uint8_t Value;    // value to store in the tag payload field
+  std::optional<uint64_t> StaticMagic; // Hardcoded magic number
 
   /// Base pointers (stripped of GEP/bitcasts) of atomic RMW/CAS instructions
   /// in this region.  Used to compute the bloom-filter atomic_magic at the
@@ -77,7 +78,8 @@ struct LoopRegion {
 /// A standalone dense BB (not covered by any dense loop).
 struct BBRegion {
   llvm::BasicBlock *BB;
-  uint8_t TypeMask; // value to store in the tag payload field
+  uint8_t Value;    // value to store in the tag payload field
+  std::optional<uint64_t> StaticMagic; // Hardcoded magic number
 
   /// Base pointers — same semantics as LoopRegion::BasePointers.
   llvm::SmallVector<llvm::Value *, 4> BasePointers;
@@ -92,7 +94,8 @@ struct BBRegion {
 struct RangedRegion {
   llvm::Instruction *StartInst;  // Instrumentation point for SET (before this inst)
   llvm::Instruction *EndInst;    // Instrumentation point for CLR (after this inst)
-  uint8_t TypeMask;              // Value to store in the tag payload field
+  uint8_t Value;               // Value to store in the tag payload field
+  std::optional<uint64_t> StaticMagic; // Hardcoded magic number
 
   /// Base pointers for bloom filter computation.
   llvm::SmallVector<llvm::Value *, 4> BasePointers;
@@ -138,7 +141,7 @@ std::pair<unsigned, bool> getLabelTypeFieldIndex(llvm::StringRef LabelType);
 /// The payload value itself serves as the activity indicator (non-zero =
 /// active).
 void emitFieldStore(llvm::IRBuilder<> &Builder, llvm::GlobalVariable *GV,
-                    unsigned FieldIndex, uint8_t FieldValue);
+                    unsigned FieldIndex, uint64_t FieldValue);
 
 
 /// Emit a bloom-filter hash of the given base pointers and store the result

@@ -279,7 +279,7 @@ std::optional<LoopQuery> SchedQLParser::parseLoopQuery() {
   return LQ;
 }
 
-// BasicBlockQuery ::= "bb" "[" BlockSpec "]"
+// BasicBlockQuery ::= "bb" "[" BBPatternList "]"
 std::optional<BasicBlockQuery> SchedQLParser::parseBasicBlockQuery() {
   if (!consume("bb")) {
     setError("expected 'bb'");
@@ -291,39 +291,110 @@ std::optional<BasicBlockQuery> SchedQLParser::parseBasicBlockQuery() {
     return std::nullopt;
   }
 
-  auto Spec = parseBlockSpec();
-  if (!Spec)
+  auto Patterns = parseBBPatternList();
+  if (!Patterns)
     return std::nullopt;
 
   if (!consume(']')) {
-    setError("expected ']' after block spec");
+    setError("expected ']' after BB pattern list");
     return std::nullopt;
   }
 
   BasicBlockQuery BBQ;
-  BBQ.Spec = *Spec;
+  BBQ.Patterns = *Patterns;
   return BBQ;
 }
 
-// BlockSpec ::= Identifier | "entry" | "exit"
-std::optional<BlockSpec> SchedQLParser::parseBlockSpec() {
-  BlockSpec Spec;
+// BBPatternList ::= BBPattern (";" BBPattern)*
+std::optional<SmallVector<BBPattern, 2>> SchedQLParser::parseBBPatternList() {
+  SmallVector<BBPattern, 2> Patterns;
 
+  auto P = parseBBPattern();
+  if (!P)
+    return std::nullopt;
+  Patterns.push_back(*P);
+
+  while (consume(';')) {
+    P = parseBBPattern();
+    if (!P)
+      return std::nullopt;
+    Patterns.push_back(*P);
+  }
+
+  return Patterns;
+}
+
+// BBPattern ::= "entry" | "exit" | "name" "=" Identifier
+//            | Category "=" TypeSpec
+// Category ::= "contains" | "in" | "not_in"
+std::optional<BBPattern> SchedQLParser::parseBBPattern() {
+  BBPattern P;
+
+  // Try standalone entry/exit
   if (consume("entry")) {
-    Spec.IsEntry = true;
-    return Spec;
+    P.Category = BBPatternCategory::Entry;
+    return P;
   }
 
   if (consume("exit")) {
-    Spec.IsExit = true;
-    return Spec;
+    P.Category = BBPatternCategory::Exit;
+    return P;
   }
 
-  auto Name = parseIdentifier();
-  if (!Name)
+  // Try name=identifier
+  if (consume("name")) {
+    if (!consume('=')) {
+      setError("expected '=' after 'name'");
+      return std::nullopt;
+    }
+    auto Id = parseIdentifier();
+    if (!Id)
+      return std::nullopt;
+    P.Category = BBPatternCategory::Name;
+    P.Name = *Id;
+    return P;
+  }
+
+  // Try contains/in/not_in with TypeSpec
+  auto Cat = parseBBPatternCategory();
+  if (!Cat)
     return std::nullopt;
-  Spec.Name = *Name;
-  return Spec;
+
+  if (!consume('=')) {
+    setError("expected '=' after pattern category");
+    return std::nullopt;
+  }
+
+  auto Type = parseInstrType();
+  if (!Type)
+    return std::nullopt;
+
+  P.Category = *Cat;
+  P.Type = *Type;
+
+  // Check for optional :identifier
+  if (consume(':')) {
+    auto Id = parseIdentifier();
+    if (!Id)
+      return std::nullopt;
+    P.TypeId = *Id;
+  }
+
+  return P;
+}
+
+// BBPatternCategory ::= "contains" | "in" | "not_in"
+std::optional<BBPatternCategory> SchedQLParser::parseBBPatternCategory() {
+  if (consume("contains"))
+    return BBPatternCategory::Contains;
+  if (consume("not_in"))
+    return BBPatternCategory::NotIn;
+  if (consume("in"))
+    return BBPatternCategory::In;
+
+  setError("expected BB pattern (entry, exit, name=..., contains=..., in=..., "
+           "not_in=...)");
+  return std::nullopt;
 }
 
 // InstructionQuery ::= InstructionType "[" PredicateList "]"

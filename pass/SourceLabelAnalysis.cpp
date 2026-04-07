@@ -2,8 +2,11 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/DebugProgramInstruction.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -65,14 +68,20 @@ SourceLabelResults SourceLabelAnalysis::run(Function &F,
           << "[SourceLabel] warning: signature checking not yet implemented\n";
     }
 
-    // Execute query — use ranged overload if EndQueryAST is present
+    // Execute query based on target type
     DensityResult MatchResult;
     if (Label.hasEndQuery()) {
-      MatchResult = executeQuery(F, {Label.QueryAST, *Label.EndQueryAST}, AM,
-                                 Label.Value, Label.MagicVars);
+      // Ranged query (e.g., unshared with start/end)
+      MatchResult = executeQueryRange(F, Label);
+    } else if (Label.QueryAST.Tgt.Loop.has_value()) {
+      // Loop-based query
+      MatchResult = executeQueryLoop(F, Label, AM);
+    } else if (Label.QueryAST.Tgt.BB.has_value()) {
+      // Basic block query
+      MatchResult = executeQueryBB(F, Label);
     } else {
-      MatchResult =
-          executeQuery(F, Label.QueryAST, AM, Label.Value, Label.MagicVars);
+      // Direct instruction query
+      MatchResult = executeQueryInstruction(F, Label);
     }
 
     if (!MatchResult.empty()) {
@@ -261,6 +270,51 @@ static bool loopMatchesPattern(Loop *L, const Pattern &P) {
   return false;
 }
 
+/// Check if a basic block contains instructions matching the given InstrType.
+static bool bbContainsInstrType(BasicBlock &BB, InstrType T) {
+  return llvm::any_of(BB,
+                      [&](Instruction &I) { return matchesInstrType(I, T); });
+}
+
+/// Check if a basic block matches a single BBPattern.
+static bool matchesBBPattern(BasicBlock &BB, const BBPattern &P, Function &F) {
+  switch (P.Category) {
+  case BBPatternCategory::Entry:
+    return &BB == &F.getEntryBlock();
+
+  case BBPatternCategory::Exit:
+    return isa<ReturnInst>(BB.getTerminator());
+
+  case BBPatternCategory::Name:
+    return P.Name.has_value() && BB.getName() == *P.Name;
+
+  case BBPatternCategory::Contains:
+    if (!P.Type.has_value())
+      return false;
+    return bbContainsInstrType(BB, *P.Type);
+
+  case BBPatternCategory::In:
+    // TODO: Implement "in" semantics (dominated by specific instruction)
+    errs() << "[SourceLabel] warning: BB 'in' pattern not yet implemented\n";
+    return false;
+
+  case BBPatternCategory::NotIn:
+    // TODO: Implement "not_in" semantics
+    errs()
+        << "[SourceLabel] warning: BB 'not_in' pattern not yet implemented\n";
+    return false;
+  }
+  return false;
+}
+
+/// Check if a basic block matches all patterns in the BBPatternList.
+static bool matchesBBQuery(BasicBlock &BB, const BasicBlockQuery &BBQ,
+                           Function &F) {
+  return llvm::all_of(BBQ.Patterns, [&](const BBPattern &P) {
+    return matchesBBPattern(BB, P, F);
+  });
+}
+
 /// Find loops matching the loop query.
 static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
                                                 const LoopQuery &LQ) {
@@ -309,6 +363,7 @@ static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
 ///   1. Instructions with matching names (e.g., %mutex_ptr)
 ///   2. Function arguments with matching names
 ///   3. Global variables with matching names
+///   4. Debug info: DbgVariableRecords (LLVM 22+) or llvm.dbg.* intrinsics
 /// Returns a vector of pointer-typed values for bloom filter computation.
 static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
                                                 ArrayRef<std::string> VarNames,
@@ -327,7 +382,7 @@ static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
   for (const std::string &Name : VarNames) {
     StringRef NameRef(Name);
 
-    // 1. Search function arguments
+    // 1. Search function arguments (by IR name)
     for (Argument &Arg : F.args()) {
       if (Arg.getName() == NameRef) {
         TryAdd(&Arg);
@@ -339,7 +394,7 @@ static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
       TryAdd(GV);
     }
 
-    // 3. Search instructions in the specified BBs
+    // 3. Search instructions in the specified BBs (by IR name)
     for (BasicBlock *BB : BBs) {
       for (Instruction &I : *BB) {
         if (I.getName() == NameRef) {
@@ -354,6 +409,46 @@ static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
         }
       }
     }
+
+    // 4. Search debug info for variable name -> value mapping
+    // LLVM 22+ uses DbgVariableRecord (the new debug records format)
+    // instead of llvm.dbg.value/llvm.dbg.declare intrinsics.
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        // Iterate over DbgRecords attached to this instruction
+        for (DbgRecord &DR : I.getDbgRecordRange()) {
+          if (auto *DVR = dyn_cast<DbgVariableRecord>(&DR)) {
+            if (DILocalVariable *Var = DVR->getVariable()) {
+              if (Var->getName() == NameRef) {
+                // Get the value associated with this debug variable
+                if (Value *V = DVR->getValue()) {
+                  TryAdd(V);
+                }
+              }
+            }
+          }
+        }
+
+        // Also check legacy intrinsics (for compatibility)
+        if (auto *DbgVal = dyn_cast<DbgValueInst>(&I)) {
+          if (DILocalVariable *Var = DbgVal->getVariable()) {
+            if (Var->getName() == NameRef) {
+              if (Value *V = DbgVal->getValue()) {
+                TryAdd(V);
+              }
+            }
+          }
+        } else if (auto *DbgDecl = dyn_cast<DbgDeclareInst>(&I)) {
+          if (DILocalVariable *Var = DbgDecl->getVariable()) {
+            if (Var->getName() == NameRef) {
+              if (Value *V = DbgDecl->getAddress()) {
+                TryAdd(V);
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   return Results;
@@ -361,10 +456,12 @@ static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
 
 /// Collect base pointers based on magic_vars or fallback to automatic
 /// detection. If MagicVars is non-empty, searches for named variables.
-/// Otherwise, falls back to collectBasePointers (automatic atomic op
-/// detection).
+/// If AllowFallback is true and MagicVars is empty (or not found), falls back
+/// to collectBasePointers (automatic atomic op detection).
+/// AllowFallback should only be true for atomic-dense labels.
 static SmallVector<Value *, 4> collectMagicPointers(
     ArrayRef<BasicBlock *> BBs, ArrayRef<std::string> MagicVars, Function &F,
+    bool AllowFallback,
     const DominatorTree *DT = nullptr, BasicBlock *InsertionPoint = nullptr) {
   if (!MagicVars.empty()) {
     // Use explicit variable names
@@ -376,13 +473,23 @@ static SmallVector<Value *, 4> collectMagicPointers(
           errs() << ", ";
         errs() << MagicVars[i];
       }
-      errs() << "], falling back to automatic detection\n";
-      return collectBasePointers(BBs, DT, InsertionPoint);
+      errs() << "]";
+      if (AllowFallback) {
+        errs() << ", falling back to automatic detection\n";
+        return collectBasePointers(BBs, DT, InsertionPoint);
+      }
+      errs() << "\n";
+      return {};
     }
     return Ptrs;
   }
-  // Fallback: automatic detection of atomic operations
-  return collectBasePointers(BBs, DT, InsertionPoint);
+  // No magic_vars specified
+  if (AllowFallback) {
+    // Fallback: automatic detection of atomic operations (only for atomic-dense)
+    return collectBasePointers(BBs, DT, InsertionPoint);
+  }
+  // No fallback allowed (e.g., unshared without magic_vars)
+  return {};
 }
 
 //===----------------------------------------------------------------------===//
@@ -401,12 +508,11 @@ findMatchingInstructions(Function &F, const InstructionQuery &IQ) {
 }
 
 /// Execute a ranged query (start/end pair) for precise range labeling.
-DensityResult executeQuery(Function &F,
-                           std::pair<const Query &, const Query &> Range,
-                           FunctionAnalysisManager &AM, uint8_t TypeMask,
-                           ArrayRef<std::string> MagicVars) {
+/// Used for labels like "unshared" where the scheduler needs exact boundaries.
+DensityResult executeQueryRange(Function &F, const SourceLabel &Label) {
   DensityResult Result;
-  const auto &[StartQ, EndQ] = Range;
+  const Query &StartQ = Label.QueryAST;
+  const Query &EndQ = *Label.EndQueryAST;
 
   // Ranged queries only support direct instruction queries (not loop/bb)
   if (StartQ.Tgt.Loop.has_value() || StartQ.Tgt.BB.has_value()) {
@@ -431,19 +537,26 @@ DensityResult executeQuery(Function &F,
            << "pairing " << NumPairs << "\n";
   }
 
+  bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
+  // Only atomic-dense should fallback to automatic atomic detection
+  bool AllowFallback = (Label.Type == "atomic-dense");
+
   for (size_t i = 0; i < NumPairs; ++i) {
     RangedRegion RR;
     RR.StartInst = StartInsts[i];
     RR.EndInst = EndInsts[i];
-    RR.TypeMask = TypeMask;
+    RR.Value = Label.Value;
+    RR.StaticMagic = Label.StaticMagic;
 
-    // Collect base pointers from both start and end BBs
-    SmallVector<BasicBlock *, 2> BBs;
-    BBs.push_back(RR.StartInst->getParent());
-    if (RR.EndInst->getParent() != RR.StartInst->getParent()) {
-      BBs.push_back(RR.EndInst->getParent());
+    // Only collect base pointers if bloom filter is needed and no static magic is set
+    if (NeedsBloom && !RR.StaticMagic) {
+      SmallVector<BasicBlock *, 2> BBs;
+      BBs.push_back(RR.StartInst->getParent());
+      if (RR.EndInst->getParent() != RR.StartInst->getParent()) {
+        BBs.push_back(RR.EndInst->getParent());
+      }
+      RR.BasePointers = collectMagicPointers(BBs, Label.MagicVars, F, AllowFallback);
     }
-    RR.BasePointers = collectMagicPointers(BBs, MagicVars, F);
 
     Result.RangedRegions.push_back(RR);
 
@@ -458,89 +571,106 @@ DensityResult executeQuery(Function &F,
   return Result;
 }
 
-/// Execute a single query for loop/BB/instruction labeling.
-DensityResult executeQuery(Function &F, const Query &Q,
-                           FunctionAnalysisManager &AM, uint8_t TypeMask,
-                           ArrayRef<std::string> MagicVars) {
+/// Execute a loop-based query.
+/// Finds all matching loops and instruments them.
+DensityResult executeQueryLoop(Function &F, const SourceLabel &Label,
+                               FunctionAnalysisManager &AM) {
   DensityResult Result;
+  
+  if (!Label.QueryAST.Tgt.Loop.has_value()) {
+    return Result;
+  }
+  
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  const auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto Loops = findMatchingLoops(LI, *Label.QueryAST.Tgt.Loop);
+  
+  bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
+  bool AllowFallback = (Label.Type == "atomic-dense");
 
-  // Handle loop-based queries
-  if (Q.Tgt.Loop.has_value()) {
-    auto &LI = AM.getResult<LoopAnalysis>(F);
-    const auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-    auto Loops = findMatchingLoops(LI, *Q.Tgt.Loop);
+  for (Loop *L : Loops) {
+    LoopRegion LR;
+    LR.Preheader = L->getLoopPreheader();
+    if (!LR.Preheader) {
+      errs() << "[SourceLabel] warning: loop has no preheader in "
+             << L->getHeader()->getParent()->getName()
+             << ", cannot instrument (consider using opt -loop-simplify first)\n";
+      continue;
+    }
+    LR.Value = Label.Value;
+    LR.StaticMagic = Label.StaticMagic;
 
-    for (Loop *L : Loops) {
-      LoopRegion LR;
-      LR.Preheader = L->getLoopPreheader();
-      if (!LR.Preheader) {
-        errs() << "[SourceLabel] warning: loop has no preheader in "
-               << L->getHeader()->getParent()->getName()
-               << ", cannot instrument (consider using opt -loop-simplify "
-                  "first)\n";
-        continue;
-      }
-      LR.TypeMask = TypeMask;
-
+    // Only collect base pointers if bloom filter is needed and no static magic is set
+    if (NeedsBloom && !LR.StaticMagic) {
       SmallVector<BasicBlock *, 8> LoopBBs(L->blocks().begin(),
                                            L->blocks().end());
       LR.BasePointers =
-          collectMagicPointers(LoopBBs, MagicVars, F, &DT, LR.Preheader);
-      Result.Loops.push_back(LR);
-
-      errs() << "[SourceLabel] matched loop at " << LR.Preheader->getName()
-             << " (bases=" << LR.BasePointers.size() << ")\n";
+          collectMagicPointers(LoopBBs, Label.MagicVars, F, AllowFallback, &DT, LR.Preheader);
     }
-    return Result;
+    Result.Loops.push_back(LR);
+
+    errs() << "[SourceLabel] matched loop at " << LR.Preheader->getName()
+           << " (bases=" << LR.BasePointers.size() << ")\n";
   }
 
-  // Handle basic block queries
-  if (Q.Tgt.BB.has_value()) {
-    const auto &Spec = Q.Tgt.BB->Spec;
-    BasicBlock *TargetBB = nullptr;
+  return Result;
+}
 
-    if (Spec.IsEntry) {
-      TargetBB = &F.getEntryBlock();
-    } else if (Spec.IsExit) {
-      for (BasicBlock &BB : F) {
-        if (isa<ReturnInst>(BB.getTerminator())) {
-          TargetBB = &BB;
-          break;
-        }
-      }
-    } else if (Spec.Name.has_value()) {
-      for (BasicBlock &BB : F) {
-        if (BB.getName() == *Spec.Name) {
-          TargetBB = &BB;
-          break;
-        }
-      }
-    }
+/// Execute a basic block query.
+DensityResult executeQueryBB(Function &F, const SourceLabel &Label) {
+  DensityResult Result;
+  
+  if (!Label.QueryAST.Tgt.BB.has_value()) {
+    return Result;
+  }
+  
+  const auto &BBQ = *Label.QueryAST.Tgt.BB;
+  bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
+  bool AllowFallback = (Label.Type == "atomic-dense");
 
-    if (TargetBB) {
+  // Find all BBs matching the query patterns
+  for (BasicBlock &BB : F) {
+    if (matchesBBQuery(BB, BBQ, F)) {
       BBRegion BR;
-      BR.BB = TargetBB;
-      BR.TypeMask = TypeMask;
-      BasicBlock *BBPtr = TargetBB;
-      BR.BasePointers =
-          collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), MagicVars, F);
+      BR.BB = &BB;
+      BR.Value = Label.Value;
+      BR.StaticMagic = Label.StaticMagic;
+
+      // Only collect base pointers if bloom filter is needed and no static magic is set
+      if (NeedsBloom && !BR.StaticMagic) {
+        BasicBlock *BBPtr = &BB;
+        BR.BasePointers = collectMagicPointers(
+            ArrayRef<BasicBlock *>(&BBPtr, 1), Label.MagicVars, F, AllowFallback);
+      }
       Result.StandaloneBBs.push_back(BR);
-      errs() << "[SourceLabel] matched BB " << TargetBB->getName()
+      errs() << "[SourceLabel] matched BB " << BB.getName()
              << " (bases=" << BR.BasePointers.size() << ")\n";
     }
-    return Result;
   }
 
-  // Handle direct instruction queries (BB-level labeling)
+  return Result;
+}
+
+/// Execute a direct instruction query (BB-level labeling based on instruction presence).
+DensityResult executeQueryInstruction(Function &F, const SourceLabel &Label) {
+  DensityResult Result;
+  bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
+  bool AllowFallback = (Label.Type == "atomic-dense");
+
   for (BasicBlock &BB : F) {
-    auto Matches = findInstructionsInBB(BB, Q.Tgt.Instruction);
+    auto Matches = findInstructionsInBB(BB, Label.QueryAST.Tgt.Instruction);
     if (!Matches.empty()) {
       BBRegion BR;
       BR.BB = &BB;
-      BR.TypeMask = TypeMask;
-      BasicBlock *BBPtr = &BB;
-      BR.BasePointers =
-          collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), MagicVars, F);
+      BR.Value = Label.Value;
+      BR.StaticMagic = Label.StaticMagic;
+
+      // Only collect base pointers if bloom filter is needed and no static magic is set
+      if (NeedsBloom && !BR.StaticMagic) {
+        BasicBlock *BBPtr = &BB;
+        BR.BasePointers =
+            collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), Label.MagicVars, F, AllowFallback);
+      }
       Result.StandaloneBBs.push_back(BR);
       errs() << "[SourceLabel] found " << Matches.size()
              << " matching instructions in BB " << BB.getName() << "\n";
@@ -683,10 +813,16 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
     // Parse the "value" field (required)
     // Supports: integer, boolean, or string (for symbolic names)
     uint8_t Value = 1; // default value for boolean fields
+    std::optional<uint64_t> StaticMagic;
 
     if (auto ValInt = LabelObj->getInteger("value")) {
       // Direct integer value
-      Value = static_cast<uint8_t>(*ValInt);
+      if (*Type == "unshared" || *Type == "atomic-dense") {
+        StaticMagic = static_cast<uint64_t>(*ValInt);
+        Value = 1; // The payload field (unshared/atomic_dense) is just a boolean flag
+      } else {
+        Value = static_cast<uint8_t>(*ValInt);
+      }
     } else if (auto ValBool = LabelObj->getBoolean("value")) {
       // Boolean: true=1, false=0
       Value = *ValBool ? 1 : 0;
@@ -706,6 +842,7 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
     L.QueryAST = ParsedQ->Start;
     L.EndQueryAST = ParsedQ->End;
     L.Value = Value;
+    L.StaticMagic = StaticMagic;
 
     // Parse magic_vars array (optional)
     if (const json::Array *MagicVarsArray = LabelObj->getArray("magic_vars")) {

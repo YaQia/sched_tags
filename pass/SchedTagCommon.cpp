@@ -180,14 +180,16 @@ void emitPrctlConstructor(Module &M, GlobalVariable *HintGV) {
 //===----------------------------------------------------------------------===//
 
 void emitFieldStore(IRBuilder<> &Builder, GlobalVariable *GV,
-                    unsigned FieldIndex, uint8_t FieldValue) {
+                    unsigned FieldIndex, uint64_t FieldValue) {
   LLVMContext &Ctx = Builder.getContext();
   StructType *HintTy = getSchedHintType(Ctx);
 
   // Store the value to the tag payload field.
   Value *FieldPtr =
       Builder.CreateStructGEP(HintTy, GV, FieldIndex, "hint.field.ptr");
-  Builder.CreateStore(ConstantInt::get(Type::getInt8Ty(Ctx), FieldValue),
+  
+  Type *FieldTy = HintTy->getElementType(FieldIndex);
+  Builder.CreateStore(ConstantInt::get(FieldTy, FieldValue),
                       FieldPtr);
 }
 

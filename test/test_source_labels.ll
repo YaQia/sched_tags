@@ -137,3 +137,43 @@ merge:
   %r = phi i32 [ %r1, %then1 ], [ %r2, %else1 ]
   ret i32 %r
 }
+
+;; ==========================================================================
+;; Test 8: BB entry block query - bb[entry]
+;; ==========================================================================
+
+define i32 @bb_test_entry(i32 %n) {
+entry:
+  ; This entry block should be matched by bb[entry]
+  call void @observe_hint(i32 60)
+  %r = add i32 %n, 1
+  ret i32 %r
+}
+
+;; ==========================================================================
+;; Test 9: BB contains atomicrmw query - bb[contains=atomicrmw]
+;; ==========================================================================
+
+define i32 @bb_test_contains(ptr %counter) {
+entry:
+  call void @observe_hint(i32 70)
+  br label %atomic_bb
+
+atomic_bb:
+  ; This BB should be matched by bb[contains=atomicrmw]
+  %old = atomicrmw add ptr %counter, i32 1 seq_cst
+  call void @observe_hint(i32 71)
+  ret i32 %old
+}
+
+;; ==========================================================================
+;; Test 10: BB combined patterns - bb[entry;contains=call]
+;; ==========================================================================
+
+define i32 @bb_test_combined(i32 %n) {
+entry:
+  ; This entry block contains call, should match bb[entry;contains=call]
+  call void @observe_hint(i32 80)
+  %r = add i32 %n, 1
+  ret i32 %r
+}

@@ -41,6 +41,24 @@
             "query": "@branchy_code/call[first]",
             "value": 1,
             "comment": "Test 7: branch-dense via source label"
+        },
+        {
+            "type": "compute-dense",
+            "query": "@bb_test_entry/bb[entry]",
+            "value": "INT",
+            "comment": "Test 8: BB entry block query"
+        },
+        {
+            "type": "compute-dense",
+            "query": "@bb_test_contains/bb[contains=atomicrmw]",
+            "value": "INT",
+            "comment": "Test 9: BB contains atomicrmw query"
+        },
+        {
+            "type": "compute-dense",
+            "query": "@bb_test_combined/bb[entry;contains=call]",
+            "value": "INT",
+            "comment": "Test 10: BB combined patterns (entry + contains call)"
         }
     ]
 }

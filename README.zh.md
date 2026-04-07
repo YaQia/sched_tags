@@ -35,63 +35,7 @@ make -j$(nproc)
 
 ## SchedQL 查询语言
 
-```ebnf
-
-(* SchedQL - 调度标签查询语言 *)
-
-(* 顶层查询 *)
-    Query ::= "@" FunctionSpec "/" Target
-
-(* 函数定位 *)
-    FunctionSpec ::= Identifier | Identifier "[" Signature "]"
-    Signature ::= Type ("," Type)*
-
-    (* 目标定位 *)
-    (* 三种互斥的查询类型，各有固定的插桩位置 *)
-    Target ::= LoopQuery           (* 插桩位置: loop preheader *)
-    | BasicBlockQuery      (* 插桩位置: BB 入口 (first non-PHI) *)
-| InstructionQuery     (* 插桩位置: 包含该指令的 BB 入口 *)
-
-    (* 循环查询 - 匹配包含指定模式的循环 *)
-(* Base pointers 自动从循环中所有 AtomicRMW/CmpXchg 指令收集 *)
-    LoopQuery ::= "loop" "[" PatternList "]"
-
-(* 基本块查询 - 匹配指定的基本块 *)
-    BasicBlockQuery ::= "bb" "[" BlockSpec "]"
-    BlockSpec ::= Identifier | "entry" | "exit"
-
-    (* 指令查询 - 匹配包含指定指令的 BB *)
-(* 用于 BB 级标签：在函数中搜索包含该指令的所有 BB *)
-    InstructionQuery ::= InstructionType "[" PredicateList "]"
-
-(* Pattern 定义 - 用于循环匹配 *)
-    PatternList ::= Pattern (";" Pattern)*
-    Pattern ::= Category "=" TypeSpec
-    Category ::= "contains" | "in" | "not_in"
-    TypeSpec ::= Type | Type ":" Identifier
-
-(* 类型定义 *)
-    Type ::= InstructionType | StructureType
-    InstructionType ::= "atomicrmw" | "cmpxchg" | "call" | "load" | "store"
-    | "alloca" | "br" | "switch" | "ret" | "add" | "fadd"
-    | "mul" | "fmul" | "sub" | "fsub" | "div" | "fdiv"
-    StructureType ::= "loop" | "br" | "switch"
-
-(* Predicate 定义 - 用于指令过滤 *)
-    PredicateList ::= Predicate ("," Predicate)*
-    Predicate ::= Position | "func" "=" Identifier | "var" "=" Identifier
-    Position ::= "first" | "last"
-
-(* 基础类型 *)
-    Identifier ::= [a-zA-Z_:][a-zA-Z0-9_:]*   (* 支持 C++ 命名空间如 Foo::Bar *)
-    Number ::= [0-9]+
-
-    (* 示例查询 *)
-    (* @Disruptor::Sequence::compareAndSet/cmpxchg[first]     - BB级: 匹配含cmpxchg的BB *)
-    (* @Disruptor::SequenceGroups::addSequences/loop[contains=call]  - 循环级: 匹配含call的循环 *)
-(* @Disruptor::SpinWait::spinOnce/bb[entry]               - BB级: 匹配函数入口块 *)
-(* @worker_thread/call[func=pthread_mutex_lock]           - BB级: 匹配调用特定函数的指令 *)
-```
+定义见[schedql.ebnf](./schedql.ebnf)
 
 ### TODO List
 

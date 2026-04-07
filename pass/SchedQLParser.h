@@ -80,16 +80,27 @@ struct LoopQuery {
   llvm::SmallVector<Pattern, 2> Patterns;
 };
 
-/// Basic block specifier: identifier | entry | exit
-struct BlockSpec {
-  std::optional<std::string> Name;
-  bool IsEntry = false;
-  bool IsExit = false;
+/// BB pattern category: entry | exit | name | contains | in | not_in
+enum class BBPatternCategory {
+  Entry,    // entry block
+  Exit,     // exit block (has return instruction)
+  Name,     // specific block by name
+  Contains, // contains instruction of type
+  In,       // dominated by instruction
+  NotIn     // not dominated by instruction
 };
 
-/// Basic block query: bb BlockSpec
+/// BB pattern: entry | exit | name=foo | contains=Type | in=Type | not_in=Type
+struct BBPattern {
+  BBPatternCategory Category;
+  std::optional<InstrType> Type;     // For contains/in/not_in
+  std::optional<std::string> Name;   // For name=
+  std::optional<std::string> TypeId; // Type:identifier form
+};
+
+/// Basic block query: bb[BBPatternList]
 struct BasicBlockQuery {
-  BlockSpec Spec;
+  llvm::SmallVector<BBPattern, 2> Patterns;
 };
 
 /// Target: loop/instruction | bb/instruction | instruction
@@ -154,7 +165,9 @@ private:
   std::optional<Target> parseTarget();
   std::optional<LoopQuery> parseLoopQuery();
   std::optional<BasicBlockQuery> parseBasicBlockQuery();
-  std::optional<BlockSpec> parseBlockSpec();
+  std::optional<llvm::SmallVector<BBPattern, 2>> parseBBPatternList();
+  std::optional<BBPattern> parseBBPattern();
+  std::optional<BBPatternCategory> parseBBPatternCategory();
   std::optional<InstructionQuery> parseInstructionQuery();
   std::optional<llvm::SmallVector<Pattern, 2>> parsePatternList();
   std::optional<Pattern> parsePattern();

@@ -18,9 +18,15 @@ Target ::= LoopQuery           (* 插桩位置: loop preheader *)
 LoopQuery ::= "loop" "[" PatternList "]"
 
 (* 基本块查询 - 匹配指定的基本块 *)
-BasicBlockQuery ::= "bb" "[" BlockSpec "]"
-BlockSpec ::= Identifier | "entry" | "exit"
-
+BasicBlockQuery ::= "bb" "[" BBPatternList "]"
+BBPatternList ::= BBPattern (";" BBPattern)*
+BBPattern ::= "entry"                      (* 入口块 *)
+           | "exit"                        (* 退出块，含 ret 指令 *)
+           | "name" "=" Identifier         (* 按标签名匹配 *)
+           | BBCategory "=" TypeSpec       (* 按指令类型匹配 *)
+BBCategory ::= "contains"                  (* 包含该类型指令 *)
+            | "in"                         (* 被该类型指令支配 *)
+            | "not_in"                     (* 不被该类型指令支配 *)
 (* 指令查询 - 匹配包含指定指令的 BB *)
 (* 用于 BB 级标签：在函数中搜索包含该指令的所有 BB *)
 InstructionQuery ::= InstructionType "[" PredicateList "]"

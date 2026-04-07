@@ -83,12 +83,30 @@ struct BBRegion {
   llvm::SmallVector<llvm::Value *, 4> BasePointers;
 };
 
+/// A ranged region with explicit start and end instrumentation points.
+/// Used for labels like "unshared" where the scheduler needs precise
+/// knowledge of when the label becomes active and when it ends.
+/// 
+/// Unlike LoopRegion/BBRegion where the label persists until quiescent,
+/// RangedRegion labels are explicitly cleared at the end point.
+struct RangedRegion {
+  llvm::Instruction *StartInst;  // Instrumentation point for SET (before this inst)
+  llvm::Instruction *EndInst;    // Instrumentation point for CLR (after this inst)
+  uint8_t TypeMask;              // Value to store in the tag payload field
+
+  /// Base pointers for bloom filter computation.
+  llvm::SmallVector<llvm::Value *, 4> BasePointers;
+};
+
 /// Per-function instrumentation plan produced by a density analysis.
 struct DensityResult {
   llvm::SmallVector<LoopRegion, 4> Loops;
   llvm::SmallVector<BBRegion, 8> StandaloneBBs;
+  llvm::SmallVector<RangedRegion, 4> RangedRegions;  // For unshared, etc.
 
-  bool empty() const { return Loops.empty() && StandaloneBBs.empty(); }
+  bool empty() const { 
+    return Loops.empty() && StandaloneBBs.empty() && RangedRegions.empty(); 
+  }
 };
 
 //===----------------------------------------------------------------------===//

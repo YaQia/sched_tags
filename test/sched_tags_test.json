@@ -1,0 +1,46 @@
+{
+    "labels": [
+        {
+            "type": "compute-dense",
+            "query": "@labeled_compute/call[first]",
+            "value": "INT",
+            "comment": "Test 1: BB-level compute-dense via source label"
+        },
+        {
+            "type": "atomic-dense",
+            "query": "@labeled_atomic_loop/loop[contains=atomicrmw]",
+            "value": 1,
+            "comment": "Test 2: Loop-level atomic-dense via source label"
+        },
+        {
+            "type": "unshared",
+            "query": {
+                "start": "@critical_section/call[func=mutex_lock]",
+                "end": "@critical_section/call[func=mutex_unlock]"
+            },
+            "magic_vars": ["global_mutex"],
+            "comment": "Test 3: Ranged unshared label with start/end"
+        },
+        {
+            "type": "unshared",
+            "query": {
+                "start": "@another_critical/call[func=mutex_lock]",
+                "end": "@another_critical/call[func=mutex_unlock]"
+            },
+            "magic_vars": ["global_mutex"],
+            "comment": "Test 4: Another ranged unshared label"
+        },
+        {
+            "type": "io-dense",
+            "query": "@io_operation/call[first]",
+            "value": 1,
+            "comment": "Test 6: io-dense via source label"
+        },
+        {
+            "type": "branch-dense",
+            "query": "@branchy_code/call[first]",
+            "value": 1,
+            "comment": "Test 7: branch-dense via source label"
+        }
+    ]
+}

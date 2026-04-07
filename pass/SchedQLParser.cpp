@@ -470,19 +470,17 @@ std::optional<Predicate> SchedQLParser::parsePredicate() {
     return P;
   }
 
-  setError("expected predicate (first, last, entry, func=..., var=...)");
+  setError("expected predicate (first, last, func=..., var=...)");
   return std::nullopt;
 }
 
-// Position ::= "first" | "last" | "entry"
+// Position ::= "first" | "last"
 std::optional<Position> SchedQLParser::parsePosition() {
   size_t SavePos = Pos;
   if (consume("first"))
     return Position::First;
   if (consume("last"))
     return Position::Last;
-  if (consume("entry"))
-    return Position::Entry;
   Pos = SavePos; // Restore position on failure
   return std::nullopt;
 }

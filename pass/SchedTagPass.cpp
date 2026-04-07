@@ -82,6 +82,12 @@ static void deduplicateRegions(DensityResult &Plan,
     MarkedBBs.insert(BR.BB);
   }
 
+  // Add all BBs covered by ranged regions
+  for (const auto &RR : SourcePlan.RangedRegions) {
+    MarkedBBs.insert(RR.StartInst->getParent());
+    MarkedBBs.insert(RR.EndInst->getParent());
+  }
+
   if (MarkedBBs.empty())
     return; // Nothing to deduplicate
 
@@ -112,11 +118,13 @@ static void deduplicateRegions(DensityResult &Plan,
 /// @p NameFn         — optional callback to pretty-print the TypeMask
 ///
 /// Returns the number of SET stores inserted.
-/// Note: Tag clearing is handled by the kernel scheduler on context switch,
-///       not by instrumented code.
+/// Note: For LoopRegion and BBRegion, tag clearing is handled by the kernel 
+///       scheduler on quiescent, not by instrumented code.
+///       For RangedRegion, we emit explicit CLR at the end instruction.
 struct InstrStats {
   unsigned LoopSets = 0;
   unsigned BBSets = 0;
+  unsigned RangedSets = 0;  // SET/CLR pairs for RangedRegion
 };
 
 static InstrStats
@@ -166,6 +174,50 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     errs() << "[SchedTag]   BB   SET  " << F.getName()
            << "::" << BR.BB->getName() << " -> " << TagName << " " << ValStr
            << " (bases=" << BR.BasePointers.size() << ")\n";
+  }
+
+  // --- Ranged region instrumentation (e.g., unshared) ---
+  // For ranged regions, we emit:
+  //   - SET *before* StartInst (so scheduler sees the tag when blocking)
+  //   - CLR *after* EndInst (so scheduler knows resource is released)
+  for (auto &RR : Plan.RangedRegions) {
+    // SET before StartInst
+    {
+      IRBuilder<> Builder(RR.StartInst);
+      emitFieldStore(Builder, HintGV, FieldIdx, RR.TypeMask);
+      if (EmitBloomMagic)
+        emitBloomMagicStore(Builder, HintGV, RR.BasePointers, MagicFieldIdx);
+    }
+    
+    // CLR after EndInst (store 0 to clear the tag)
+    {
+      // Insert after EndInst: get the next instruction
+      Instruction *InsertPoint = RR.EndInst->getNextNode();
+      if (InsertPoint) {
+        IRBuilder<> Builder(InsertPoint);
+        emitFieldStore(Builder, HintGV, FieldIdx, 0);  // Clear tag
+        if (EmitBloomMagic) {
+          // Clear magic field too
+          emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);  // Empty = 0
+        }
+      } else {
+        // EndInst is terminator, insert before it
+        // (This shouldn't normally happen for lock/unlock patterns)
+        errs() << "[SchedTag] warning: EndInst is terminator, cannot insert CLR after\n";
+      }
+    }
+    
+    Stats.RangedSets++;
+
+    std::string ValStr =
+        NameFn ? NameFn(RR.TypeMask) : std::to_string(RR.TypeMask);
+    errs() << "[SchedTag]   RANGE SET/CLR  " << F.getName()
+           << "::" << RR.StartInst->getParent()->getName() << "/"
+           << RR.StartInst->getOpcodeName() << " → "
+           << RR.EndInst->getParent()->getName() << "/"
+           << RR.EndInst->getOpcodeName()
+           << " -> " << TagName << " " << ValStr
+           << " (bases=" << RR.BasePointers.size() << ")\n";
   }
 
   return Stats;
@@ -253,6 +305,9 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
       CombinedSourcePlan.StandaloneBBs.append(
           SourceLabel.Regions.StandaloneBBs.begin(),
           SourceLabel.Regions.StandaloneBBs.end());
+      CombinedSourcePlan.RangedRegions.append(
+          SourceLabel.Regions.RangedRegions.begin(),
+          SourceLabel.Regions.RangedRegions.end());
     }
 
     // Then deduplicate automatic analyses against source labels
@@ -299,7 +354,8 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   errs() << "[SchedTag]   atomic:  " << TotalAtomic.LoopSets << " loop-SET, "
          << TotalAtomic.BBSets << " bb-SET\n";
   errs() << "[SchedTag]   source:  " << TotalSource.LoopSets << " loop-SET, "
-         << TotalSource.BBSets << " bb-SET\n";
+         << TotalSource.BBSets << " bb-SET, "
+         << TotalSource.RangedSets << " ranged-SET/CLR\n";
   if (DeduplicatedLoops > 0 || DeduplicatedBBs > 0) {
     errs() << "[SchedTag]   deduplicated: " << DeduplicatedLoops
            << " loops, " << DeduplicatedBBs

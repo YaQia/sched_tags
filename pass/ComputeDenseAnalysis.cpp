@@ -1,6 +1,7 @@
 #include "ComputeDenseAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
@@ -28,9 +29,10 @@ static constexpr double PER_TYPE_THRES = 0.25;
 
 ComputeOpType computeOpType(Instruction &I) {
   // Exclude non-compute instructions.
+  // Use CallBase to cover both CallInst and InvokeInst (C++/Rust exceptions)
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<PHINode>(I) ||
       isa<SelectInst>(I) || isa<AllocaInst>(I) || I.isTerminator() ||
-      isa<CallInst>(I))
+      isa<CallBase>(I))
     return ComputeOpType::NONE;
 
   bool isIntOp = false, isFloatOp = false;
@@ -83,15 +85,10 @@ ComputeOpType computeOpType(Instruction &I) {
   }
 
   // Vector operands -> SIMD regardless of opcode category.
-  bool isVector = I.getType()->isVectorTy();
-  if (!isVector) {
-    for (unsigned i = 0; i < I.getNumOperands(); ++i) {
-      if (I.getOperand(i)->getType()->isVectorTy()) {
-        isVector = true;
-        break;
-      }
-    }
-  }
+  bool isVector = I.getType()->isVectorTy() ||
+      llvm::any_of(I.operands(), [](const Use &U) {
+        return U->getType()->isVectorTy();
+      });
   if (isVector)
     return ComputeOpType::SIMD;
 
@@ -232,19 +229,12 @@ ComputeDense::Result ComputeDense::run(Function &F,
       continue;
     }
 
-    // Collect and deduplicate exit blocks.
-    SmallVector<BasicBlock *, 4> RawExits;
-    L->getExitBlocks(RawExits);
-
     LoopRegion LR;
     LR.Preheader = Preheader;
     LR.TypeMask = LoopMask;
 
-    DenseSet<BasicBlock *> Seen;
-    for (BasicBlock *Exit : RawExits) {
-      if (Seen.insert(Exit).second)
-        LR.ExitBlocks.push_back(Exit);
-    }
+    // Get deduplicated exit blocks directly using LLVM's built-in method
+    L->getUniqueExitBlocks(LR.ExitBlocks);
 
     Plan.Loops.push_back(std::move(LR));
 

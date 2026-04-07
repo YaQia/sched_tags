@@ -245,19 +245,12 @@ AtomicDense::Result AtomicDense::run(Function &F,
       continue;
     }
 
-    // Collect and deduplicate exit blocks.
-    SmallVector<BasicBlock *, 4> RawExits;
-    L->getExitBlocks(RawExits);
-
     LoopRegion LR;
     LR.Preheader = Preheader;
     LR.TypeMask = 1; // atomic_dense is a boolean flag
 
-    DenseSet<BasicBlock *> Seen;
-    for (BasicBlock *Exit : RawExits) {
-      if (Seen.insert(Exit).second)
-        LR.ExitBlocks.push_back(Exit);
-    }
+    // Get deduplicated exit blocks directly using LLVM's built-in method
+    L->getUniqueExitBlocks(LR.ExitBlocks);
 
     // Collect base pointers for bloom-filter magic computation.
     // Use dominance-aware collection: pointers defined inside the loop

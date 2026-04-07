@@ -80,7 +80,7 @@ make -j$(nproc)
 (* Predicate 定义 - 用于指令过滤 *)
     PredicateList ::= Predicate ("," Predicate)*
     Predicate ::= Position | "func" "=" Identifier | "var" "=" Identifier
-    Position ::= "first" | "last" | "entry"
+    Position ::= "first" | "last"
 
 (* 基础类型 *)
     Identifier ::= [a-zA-Z_:][a-zA-Z0-9_:]*   (* 支持 C++ 命名空间如 Foo::Bar *)
@@ -90,12 +90,13 @@ make -j$(nproc)
     (* @Disruptor::Sequence::compareAndSet/cmpxchg[first]     - BB级: 匹配含cmpxchg的BB *)
     (* @Disruptor::SequenceGroups::addSequences/loop[contains=call]  - 循环级: 匹配含call的循环 *)
 (* @Disruptor::SpinWait::spinOnce/bb[entry]               - BB级: 匹配函数入口块 *)
+(* @worker_thread/call[func=pthread_mutex_lock]           - BB级: 匹配调用特定函数的指令 *)
 ```
 
 ### TODO List
 
 - [ ] `loop[in=Type]` 模式
 - [ ] `loop[not_in=Type]` 模式
-- [ ] `func=name` 谓词（调用特定函数）
-- [ ] `var=name` 谓词（使用特定变量）
+- [x] `func=name` 谓词（调用特定函数）
+- [x] `var=name` 谓词（使用特定变量）
 - [ ] 函数签名精确匹配

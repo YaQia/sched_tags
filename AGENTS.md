@@ -7,7 +7,7 @@
     "labels": [
         {
             "type": "<label-type>",
-            "query": "<schedql-query>",
+            "query": "<schedql-query>" | { "start": "<schedql-query>", "end": "<schedql-query>" },
             "value": "<label-value>",
             "magic_vars": ["<var-name1>", "<var-name2>"],
             "comment": "<human-readable explanation>"
@@ -20,10 +20,76 @@
 | 字段 | 必需 | 描述 |
 |------|------|------|
 | `type` | 是 | 标签类型 |
-| `query` | 是 | SchedQL 查询语句，定位代码区域 |
+| `query` | 是 | SchedQL 查询语句，支持字符串或对象形式（见下文） |
 | `value` | 否 | 标签值（默认 1） |
 | `magic_vars` | 否 | 变量名数组，用于 bloom filter 计算（适用于 `atomic-dense` 和 `unshared`） |
 | `comment` | 否 | 人类可读的说明 |
+
+### query 字段格式
+`query` 字段支持两种形式：
+
+**1. 字符串形式**（适用于大多数标签）：
+```json
+"query": "@function_name/loop[contains=fmul]/fmul[first]"
+```
+
+**2. 对象形式**（支持精确范围控制）：
+```json
+"query": {
+    "start": "<start-position-query>",
+    "end": "<end-position-query>"
+}
+```
+
+**行为规则**：
+| 标签类型 | query 形式 | 行为 |
+|---------|-----------|------|
+| 普通标签 | 字符串 | 在该位置插桩，标签持续到任务 quiescent |
+| 普通标签 | 对象 `{ start, end? }` | 只采纳 `start` 位置插桩，`end` 被忽略 |
+| `unshared` | 对象 `{ start, end }` | **必须**同时指定 start 和 end，精确控制范围 |
+| `unshared` | 字符串或缺少 `end` | **编译报错** |
+
+### unshared 标签的特殊要求
+`unshared` 标签用于标记独占资源的持有期间，调度器强依赖其精确范围：
+
+**1. 必须使用对象形式的 query**，同时指定 `start` 和 `end`
+
+**2. 插桩时序要求**：
+```
+                    ┌─ start 标签必须插在此处（获取资源之前）
+                    ▼
+线程代码:    [...] → lock(mutex) → [critical section] → unlock(mutex) → [...]
+                                                        ▲
+                                                        └─ end 标签插在此处（释放资源之后）
+```
+
+- `start` 必须在**获取独占资源之前**插桩
+  - 原因：调度器需要在任务因等待资源而睡眠时，通过 `unshared=1` 判断睡眠原因
+  - 如果 start 插在 lock 之后，任务阻塞时 `unshared=0`，调度器无法感知
+- `end` 必须在**释放独占资源之后**插桩
+  - 原因：确保资源已完全释放，调度器可以安全地调度其他等待该资源的任务
+
+**3. 错误示例**：
+```json
+// 错误：unshared 必须使用对象形式
+{ "type": "unshared", "query": "@lock/call[first]" }
+
+// 错误：unshared 必须同时有 start 和 end
+{ "type": "unshared", "query": { "start": "@lock/call[first]" } }
+```
+
+**4. 正确示例**：
+```json
+{
+    "type": "unshared",
+    "query": {
+        "start": "@pthread_mutex_lock/call[first]",
+        "end": "@pthread_mutex_unlock/call[last]"
+    },
+    "magic_vars": ["mutex"],
+    "comment": "Mutex critical section - precise range required for scheduler"
+}
+```
 
 ### magic_vars 字段
 对于需要 bloom filter 的标签类型（`atomic-dense`、`unshared`），`magic_vars` 指定哪些变量的地址应被追踪：
@@ -127,7 +193,6 @@ Predicate ::= Position
            | "var" "=" Identifier       (* 变量名匹配 *)
 Position ::= "first"                    (* 第一个匹配 *)
           | "last"                      (* 最后一个匹配 *)
-          | "entry"                     (* 入口指令 *)
 (* 基础类型 *)
 Identifier ::= [a-zA-Z_][a-zA-Z0-9_]*
 Number ::= [0-9]+
@@ -194,6 +259,15 @@ Number ::= [0-9]+
             "query": "@database::scan_records/loop[contains=load]/load[first]",
             "value": "STREAM",
             "comment": "Database table scan - sequential memory access pattern"
+        },
+        {
+            "type": "unshared",
+            "query": {
+                "start": "@worker_thread/call[func=pthread_mutex_lock]",
+                "end": "@worker_thread/call[func=pthread_mutex_unlock]"
+            },
+            "magic_vars": ["task_queue_mutex"],
+            "comment": "Task queue mutex - scheduler needs precise hold duration"
         }
     ]
 }

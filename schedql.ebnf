@@ -41,7 +41,7 @@ StructureType ::= "loop" | "br" | "switch"
 (* Predicate 定义 - 用于指令过滤 *)
 PredicateList ::= Predicate ("," Predicate)*
 Predicate ::= Position | "func" "=" Identifier | "var" "=" Identifier
-Position ::= "first" | "last" | "entry"
+Position ::= "first" | "last"
 
 (* 基础类型 *)
 Identifier ::= [a-zA-Z_:][a-zA-Z0-9_:]*   (* 支持 C++ 命名空间如 Foo::Bar *)

@@ -49,8 +49,8 @@ enum class InstrType {
   FDiv,
 };
 
-/// Predicate position (first, last, entry)
-enum class Position { First, Last, Entry };
+/// Predicate position (first, last)
+enum class Position { First, Last };
 
 /// Predicate in instruction query: first | last | func=foo | var=bar
 struct Predicate {

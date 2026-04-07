@@ -1,5 +1,6 @@
 #include "SourceLabelAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
@@ -60,17 +61,28 @@ SourceLabelResults SourceLabelAnalysis::run(Function &F,
     // TODO: Check signature if specified
     if (Label.QueryAST.Function.Sig.has_value()) {
       // For minimum implementation, skip signature checking
-      errs() << "[SourceLabel] warning: signature checking not yet implemented\n";
+      errs()
+          << "[SourceLabel] warning: signature checking not yet implemented\n";
     }
 
-    // Execute query with the label's value and magic_vars
-    auto MatchResult = executeQuery(F, Label.QueryAST, AM, Label.Value,
-                                    Label.MagicVars);
+    // Execute query — use ranged overload if EndQueryAST is present
+    DensityResult MatchResult;
+    if (Label.hasEndQuery()) {
+      MatchResult = executeQuery(F, {Label.QueryAST, *Label.EndQueryAST}, AM,
+                                 Label.Value, Label.MagicVars);
+    } else {
+      MatchResult =
+          executeQuery(F, Label.QueryAST, AM, Label.Value, Label.MagicVars);
+    }
 
     if (!MatchResult.empty()) {
-      errs() << "[SourceLabel] matched query in " << F.getName() << ": type="
-             << Label.Type << ", value=" << (int)Label.Value << "\n";
-      
+      errs() << "[SourceLabel] matched query in " << F.getName()
+             << ": type=" << Label.Type << ", value=" << (int)Label.Value;
+      if (Label.hasEndQuery()) {
+        errs() << " (ranged)";
+      }
+      errs() << "\n";
+
       // Add this label's result to the combined results
       Result.Labels.push_back({Label.Type, std::move(MatchResult)});
     }
@@ -91,7 +103,9 @@ static bool matchesInstrType(const Instruction &I, InstrType T) {
   case InstrType::CmpXchg:
     return isa<AtomicCmpXchgInst>(I);
   case InstrType::Call:
-    return isa<CallInst>(I);
+    // Match both CallInst and InvokeInst (for languages with exceptions like
+    // C++/Rust)
+    return isa<CallBase>(I);
   case InstrType::Load:
     return isa<LoadInst>(I);
   case InstrType::Store:
@@ -141,6 +155,31 @@ static bool matchesInstrType(const Instruction &I, InstrType T) {
   return false;
 }
 
+/// Check if a call/invoke instruction calls a function with a given name.
+/// Handles both direct calls and calls through pointer casts.
+/// Supports CallInst and InvokeInst via CallBase.
+static bool callsFunction(const Instruction &I, StringRef FuncName) {
+  const CallBase *CB = dyn_cast<CallBase>(&I);
+  if (!CB)
+    return false;
+
+  Value *CalleeV = CB->getCalledOperand()->stripPointerCasts();
+  Function *Callee = dyn_cast<Function>(CalleeV);
+  if (!Callee)
+    return false;
+
+  // Check exact match first
+  if (Callee->getName() == FuncName)
+    return true;
+
+  // Check demangled name for C++ functions
+  std::string Demangled = llvm::demangle(Callee->getName().str());
+  if (Demangled.find(FuncName.str()) != std::string::npos)
+    return true;
+
+  return false;
+}
+
 /// Find matching instructions in a basic block.
 static SmallVector<Instruction *, 4>
 findInstructionsInBB(BasicBlock &BB, const InstructionQuery &IQ) {
@@ -156,6 +195,44 @@ findInstructionsInBB(BasicBlock &BB, const InstructionQuery &IQ) {
     return Matches;
 
   for (const auto &Pred : IQ.Predicates) {
+    // Handle func= predicate (for call instructions)
+    if (Pred.FuncName.has_value()) {
+      SmallVector<Instruction *, 4> Filtered;
+      for (Instruction *I : Matches) {
+        if (callsFunction(*I, *Pred.FuncName))
+          Filtered.push_back(I);
+      }
+      Matches = std::move(Filtered);
+    }
+
+    // Handle var= predicate (for memory instructions)
+    if (Pred.VarName.has_value()) {
+      SmallVector<Instruction *, 4> Filtered;
+      for (Instruction *I : Matches) {
+        // Check if the instruction uses a variable with the given name
+        // This includes global variables, alloca instructions, and arguments
+        for (Use &U : I->operands()) {
+          // Use getUnderlyingObject to strip all pointer casts and GEPs
+          Value *V = getUnderlyingObject(U.get());
+
+          // Check global variable name
+          if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+            if (GV->getName() == *Pred.VarName) {
+              Filtered.push_back(I);
+              break;
+            }
+          }
+          // Check instruction name (e.g., alloca with name)
+          if (V->hasName() && V->getName() == *Pred.VarName) {
+            Filtered.push_back(I);
+            break;
+          }
+        }
+      }
+      Matches = std::move(Filtered);
+    }
+
+    // Handle position predicates
     if (Pred.Pos.has_value()) {
       switch (*Pred.Pos) {
       case Position::First:
@@ -166,15 +243,8 @@ findInstructionsInBB(BasicBlock &BB, const InstructionQuery &IQ) {
         if (!Matches.empty())
           Matches = {Matches.back()};
         break;
-      case Position::Entry:
-        // Entry means first instruction in entry block
-        // For simplicity, treat as "first"
-        if (!Matches.empty())
-          Matches = {Matches.front()};
-        break;
       }
     }
-    // TODO: Handle func= and var= predicates
   }
 
   return Matches;
@@ -193,7 +263,7 @@ static bool loopMatchesPattern(Loop *L, const Pattern &P) {
 
 /// Find loops matching the loop query.
 static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
-                                                 const LoopQuery &LQ) {
+                                                const LoopQuery &LQ) {
   SmallVector<Loop *, 4> Matches;
 
   for (Loop *L : LI) {
@@ -211,7 +281,8 @@ static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
         break;
       case PatternCategory::NotIn:
         // TODO: Implement "not_in" semantics
-        errs() << "[SourceLabel] warning: 'not_in' pattern not yet implemented\n";
+        errs()
+            << "[SourceLabel] warning: 'not_in' pattern not yet implemented\n";
         break;
       }
 
@@ -226,7 +297,8 @@ static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
   return Matches;
 }
 
-// Note: extractBasePointers is removed - we now use collectBasePointers from SchedTagCommon.
+// Note: extractBasePointers is removed - we now use collectBasePointers from
+// SchedTagCommon.
 
 //===----------------------------------------------------------------------===//
 // Magic variable lookup
@@ -238,9 +310,9 @@ static SmallVector<Loop *, 4> findMatchingLoops(LoopInfo &LI,
 ///   2. Function arguments with matching names
 ///   3. Global variables with matching names
 /// Returns a vector of pointer-typed values for bloom filter computation.
-static SmallVector<Value *, 4>
-findValuesByName(ArrayRef<BasicBlock *> BBs, ArrayRef<std::string> VarNames,
-                 Function &F) {
+static SmallVector<Value *, 4> findValuesByName(ArrayRef<BasicBlock *> BBs,
+                                                ArrayRef<std::string> VarNames,
+                                                Function &F) {
   SmallPtrSet<Value *, 4> Seen;
   SmallVector<Value *, 4> Results;
 
@@ -287,22 +359,21 @@ findValuesByName(ArrayRef<BasicBlock *> BBs, ArrayRef<std::string> VarNames,
   return Results;
 }
 
-/// Collect base pointers based on magic_vars or fallback to automatic detection.
-/// If MagicVars is non-empty, searches for named variables.
-/// Otherwise, falls back to collectBasePointers (automatic atomic op detection).
-static SmallVector<Value *, 4>
-collectMagicPointers(ArrayRef<BasicBlock *> BBs,
-                     ArrayRef<std::string> MagicVars,
-                     Function &F,
-                     const DominatorTree *DT = nullptr,
-                     BasicBlock *InsertionPoint = nullptr) {
+/// Collect base pointers based on magic_vars or fallback to automatic
+/// detection. If MagicVars is non-empty, searches for named variables.
+/// Otherwise, falls back to collectBasePointers (automatic atomic op
+/// detection).
+static SmallVector<Value *, 4> collectMagicPointers(
+    ArrayRef<BasicBlock *> BBs, ArrayRef<std::string> MagicVars, Function &F,
+    const DominatorTree *DT = nullptr, BasicBlock *InsertionPoint = nullptr) {
   if (!MagicVars.empty()) {
     // Use explicit variable names
     auto Ptrs = findValuesByName(BBs, MagicVars, F);
     if (Ptrs.empty()) {
       errs() << "[SourceLabel] warning: no values found for magic_vars [";
       for (size_t i = 0; i < MagicVars.size(); ++i) {
-        if (i > 0) errs() << ", ";
+        if (i > 0)
+          errs() << ", ";
         errs() << MagicVars[i];
       }
       errs() << "], falling back to automatic detection\n";
@@ -318,27 +389,86 @@ collectMagicPointers(ArrayRef<BasicBlock *> BBs,
 // Query execution
 //===----------------------------------------------------------------------===//
 
+/// Find matching instructions for a direct instruction query across all BBs.
+static SmallVector<Instruction *, 8>
+findMatchingInstructions(Function &F, const InstructionQuery &IQ) {
+  SmallVector<Instruction *, 8> AllMatches;
+  for (BasicBlock &BB : F) {
+    auto Matches = findInstructionsInBB(BB, IQ);
+    AllMatches.append(Matches.begin(), Matches.end());
+  }
+  return AllMatches;
+}
+
+/// Execute a ranged query (start/end pair) for precise range labeling.
+DensityResult executeQuery(Function &F,
+                           std::pair<const Query &, const Query &> Range,
+                           FunctionAnalysisManager &AM, uint8_t TypeMask,
+                           ArrayRef<std::string> MagicVars) {
+  DensityResult Result;
+  const auto &[StartQ, EndQ] = Range;
+
+  // Ranged queries only support direct instruction queries (not loop/bb)
+  if (StartQ.Tgt.Loop.has_value() || StartQ.Tgt.BB.has_value()) {
+    errs() << "[SourceLabel] warning: ranged queries only support direct "
+           << "instruction queries for start position\n";
+    return Result;
+  }
+  if (EndQ.Tgt.Loop.has_value() || EndQ.Tgt.BB.has_value()) {
+    errs() << "[SourceLabel] warning: ranged queries only support direct "
+           << "instruction queries for end position\n";
+    return Result;
+  }
+
+  auto StartInsts = findMatchingInstructions(F, StartQ.Tgt.Instruction);
+  auto EndInsts = findMatchingInstructions(F, EndQ.Tgt.Instruction);
+
+  // Pair start and end instructions by order
+  size_t NumPairs = std::min(StartInsts.size(), EndInsts.size());
+  if (StartInsts.size() != EndInsts.size()) {
+    errs() << "[SourceLabel] warning: mismatched start/end counts ("
+           << StartInsts.size() << " starts, " << EndInsts.size() << " ends), "
+           << "pairing " << NumPairs << "\n";
+  }
+
+  for (size_t i = 0; i < NumPairs; ++i) {
+    RangedRegion RR;
+    RR.StartInst = StartInsts[i];
+    RR.EndInst = EndInsts[i];
+    RR.TypeMask = TypeMask;
+
+    // Collect base pointers from both start and end BBs
+    SmallVector<BasicBlock *, 2> BBs;
+    BBs.push_back(RR.StartInst->getParent());
+    if (RR.EndInst->getParent() != RR.StartInst->getParent()) {
+      BBs.push_back(RR.EndInst->getParent());
+    }
+    RR.BasePointers = collectMagicPointers(BBs, MagicVars, F);
+
+    Result.RangedRegions.push_back(RR);
+
+    errs() << "[SourceLabel] matched ranged region: start="
+           << RR.StartInst->getParent()->getName() << "/"
+           << RR.StartInst->getOpcodeName()
+           << ", end=" << RR.EndInst->getParent()->getName() << "/"
+           << RR.EndInst->getOpcodeName()
+           << " (bases=" << RR.BasePointers.size() << ")\n";
+  }
+
+  return Result;
+}
+
+/// Execute a single query for loop/BB/instruction labeling.
 DensityResult executeQuery(Function &F, const Query &Q,
-                           FunctionAnalysisManager &AM,
-                           uint8_t TypeMask,
+                           FunctionAnalysisManager &AM, uint8_t TypeMask,
                            ArrayRef<std::string> MagicVars) {
   DensityResult Result;
 
-  // Get LoopInfo and DominatorTree if we need them
-  LoopInfo *LI = nullptr;
-  const DominatorTree *DT = nullptr;
-  if (Q.Tgt.Loop.has_value()) {
-    LI = &AM.getResult<LoopAnalysis>(F);
-    DT = &AM.getResult<DominatorTreeAnalysis>(F);
-  }
-
   // Handle loop-based queries
-  // Simplified: loop[contains=X] is sufficient; trailing /instr is optional
-  // and only serves as an additional filter (not for positioning).
-  // Base pointers for bloom filter are collected from magic_vars if specified,
-  // otherwise falls back to automatic atomic op detection.
   if (Q.Tgt.Loop.has_value()) {
-    auto Loops = findMatchingLoops(*LI, *Q.Tgt.Loop);
+    auto &LI = AM.getResult<LoopAnalysis>(F);
+    const auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+    auto Loops = findMatchingLoops(LI, *Q.Tgt.Loop);
 
     for (Loop *L : Loops) {
       LoopRegion LR;
@@ -346,32 +476,25 @@ DensityResult executeQuery(Function &F, const Query &Q,
       if (!LR.Preheader) {
         errs() << "[SourceLabel] warning: loop has no preheader in "
                << L->getHeader()->getParent()->getName()
-               << ", cannot instrument (consider using opt -loop-simplify first)\n";
+               << ", cannot instrument (consider using opt -loop-simplify "
+                  "first)\n";
         continue;
       }
-
-      // Loop matching is based on contains= patterns in findMatchingLoops().
-      // The trailing /instr query (if any) is now ignored for loop-level labels.
-
       LR.TypeMask = TypeMask;
-      
-      // Collect base pointers using magic_vars or fallback to automatic detection
-      SmallVector<BasicBlock *, 8> LoopBBs(L->blocks().begin(), L->blocks().end());
-      LR.BasePointers = collectMagicPointers(LoopBBs, MagicVars, F, DT, LR.Preheader);
-      
+
+      SmallVector<BasicBlock *, 8> LoopBBs(L->blocks().begin(),
+                                           L->blocks().end());
+      LR.BasePointers =
+          collectMagicPointers(LoopBBs, MagicVars, F, &DT, LR.Preheader);
       Result.Loops.push_back(LR);
 
-      errs() << "[SourceLabel] matched loop at "
-             << LR.Preheader->getName() 
+      errs() << "[SourceLabel] matched loop at " << LR.Preheader->getName()
              << " (bases=" << LR.BasePointers.size() << ")\n";
     }
-
     return Result;
   }
 
-  // Handle basic block queries (bb entry | bb exit | bb <name>)
-  // No instruction filtering - just mark the specified BB.
-  // Instrumentation is at BB entry (first non-PHI instruction).
+  // Handle basic block queries
   if (Q.Tgt.BB.has_value()) {
     const auto &Spec = Q.Tgt.BB->Spec;
     BasicBlock *TargetBB = nullptr;
@@ -379,15 +502,13 @@ DensityResult executeQuery(Function &F, const Query &Q,
     if (Spec.IsEntry) {
       TargetBB = &F.getEntryBlock();
     } else if (Spec.IsExit) {
-      // Find exit blocks (blocks with return)
       for (BasicBlock &BB : F) {
         if (isa<ReturnInst>(BB.getTerminator())) {
           TargetBB = &BB;
-          break; // For simplicity, just take first exit
+          break;
         }
       }
     } else if (Spec.Name.has_value()) {
-      // Find BB by name
       for (BasicBlock &BB : F) {
         if (BB.getName() == *Spec.Name) {
           TargetBB = &BB;
@@ -400,33 +521,27 @@ DensityResult executeQuery(Function &F, const Query &Q,
       BBRegion BR;
       BR.BB = TargetBB;
       BR.TypeMask = TypeMask;
-      // Collect base pointers using magic_vars or fallback
       BasicBlock *BBPtr = TargetBB;
-      BR.BasePointers = collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1),
-                                              MagicVars, F);
+      BR.BasePointers =
+          collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), MagicVars, F);
       Result.StandaloneBBs.push_back(BR);
-
       errs() << "[SourceLabel] matched BB " << TargetBB->getName()
              << " (bases=" << BR.BasePointers.size() << ")\n";
     }
-
     return Result;
   }
 
-  // Handle direct instruction queries (search all BBs for matching instructions)
-  // This is for BB-level labeling: find BBs containing the specified instruction.
+  // Handle direct instruction queries (BB-level labeling)
   for (BasicBlock &BB : F) {
     auto Matches = findInstructionsInBB(BB, Q.Tgt.Instruction);
     if (!Matches.empty()) {
       BBRegion BR;
       BR.BB = &BB;
       BR.TypeMask = TypeMask;
-      // Collect base pointers using magic_vars or fallback
       BasicBlock *BBPtr = &BB;
-      BR.BasePointers = collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1),
-                                              MagicVars, F);
+      BR.BasePointers =
+          collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), MagicVars, F);
       Result.StandaloneBBs.push_back(BR);
-
       errs() << "[SourceLabel] found " << Matches.size()
              << " matching instructions in BB " << BB.getName() << "\n";
     }
@@ -441,6 +556,73 @@ DensityResult executeQuery(Function &F, const Query &Q,
 
 // Forward declaration
 static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr);
+
+/// Parsed query result: start query and optional end query.
+struct ParsedQuery {
+  Query Start;
+  std::optional<Query> End;
+};
+
+/// Parse the "query" field from JSON.
+/// Supports both string form ("@func/...") and object form ({ "start": "...",
+/// "end": "..." }). Returns nullopt on parse error (with diagnostics to
+/// stderr).
+static std::optional<ParsedQuery> parseQueryField(const json::Value *QueryVal) {
+  if (!QueryVal) {
+    errs() << "[SourceLabel] warning: label missing 'query' field\n";
+    return std::nullopt;
+  }
+
+  ParsedQuery Result;
+
+  if (auto QueryStr = QueryVal->getAsString()) {
+    // String form: single query
+    SchedQLParser Parser(*QueryStr);
+    auto Parsed = Parser.parse();
+    if (!Parsed) {
+      errs() << "[SourceLabel] error parsing query '" << *QueryStr
+             << "': " << Parser.getError() << "\n";
+      return std::nullopt;
+    }
+    Result.Start = *Parsed;
+    return Result;
+  }
+
+  if (const json::Object *QueryObj = QueryVal->getAsObject()) {
+    // Object form: { "start": "...", "end": "..." }
+    auto StartStr = QueryObj->getString("start");
+    if (!StartStr) {
+      errs() << "[SourceLabel] error: query object missing 'start' field\n";
+      return std::nullopt;
+    }
+
+    SchedQLParser StartParser(*StartStr);
+    auto StartParsed = StartParser.parse();
+    if (!StartParsed) {
+      errs() << "[SourceLabel] error parsing start query '" << *StartStr
+             << "': " << StartParser.getError() << "\n";
+      return std::nullopt;
+    }
+    Result.Start = *StartParsed;
+
+    // Parse end query if present
+    if (auto EndStr = QueryObj->getString("end")) {
+      SchedQLParser EndParser(*EndStr);
+      auto EndParsed = EndParser.parse();
+      if (!EndParsed) {
+        errs() << "[SourceLabel] error parsing end query '" << *EndStr
+               << "': " << EndParser.getError() << "\n";
+        return std::nullopt;
+      }
+      Result.End = *EndParsed;
+    }
+
+    return Result;
+  }
+
+  errs() << "[SourceLabel] error: 'query' must be string or object\n";
+  return std::nullopt;
+}
 
 SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
   SmallVector<SourceLabel, 4> Labels;
@@ -480,26 +662,28 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
     }
 
     auto Type = LabelObj->getString("type");
-    auto QueryStr = LabelObj->getString("query");
-
-    if (!Type || !QueryStr) {
-      errs() << "[SourceLabel] warning: label missing required fields (type, query)\n";
+    if (!Type) {
+      errs() << "[SourceLabel] warning: label missing 'type' field\n";
       continue;
     }
 
-    // Parse the SchedQL query
-    SchedQLParser Parser(*QueryStr);
-    auto QueryAST = Parser.parse();
-    if (!QueryAST) {
-      errs() << "[SourceLabel] error parsing query '" << *QueryStr
-             << "': " << Parser.getError() << "\n";
+    // Parse query field
+    auto ParsedQ = parseQueryField(LabelObj->get("query"));
+    if (!ParsedQ)
+      continue;
+
+    // Validate: unshared requires both start and end
+    if (*Type == "unshared" && !ParsedQ->End) {
+      errs()
+          << "[SourceLabel] error: 'unshared' label requires query with both "
+          << "'start' and 'end' fields for precise range control\n";
       continue;
     }
 
     // Parse the "value" field (required)
     // Supports: integer, boolean, or string (for symbolic names)
     uint8_t Value = 1; // default value for boolean fields
-    
+
     if (auto ValInt = LabelObj->getInteger("value")) {
       // Direct integer value
       Value = static_cast<uint8_t>(*ValInt);
@@ -519,9 +703,10 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
 
     SourceLabel L;
     L.Type = Type->str();
-    L.QueryAST = *QueryAST;
+    L.QueryAST = ParsedQ->Start;
+    L.EndQueryAST = ParsedQ->End;
     L.Value = Value;
-    
+
     // Parse magic_vars array (optional)
     if (const json::Array *MagicVarsArray = LabelObj->getArray("magic_vars")) {
       for (const auto &VarVal : *MagicVarsArray) {
@@ -530,16 +715,20 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
         }
       }
     }
-    
+
     Labels.push_back(L);
 
     errs() << "[SourceLabel] loaded label: type=" << L.Type
-           << ", func=" << L.QueryAST.Function.Name
-           << ", value=" << (int)L.Value;
+           << ", func=" << L.QueryAST.Function.Name;
+    if (L.hasEndQuery()) {
+      errs() << " (ranged: start→end)";
+    }
+    errs() << ", value=" << (int)L.Value;
     if (!L.MagicVars.empty()) {
       errs() << ", magic_vars=[";
       for (size_t i = 0; i < L.MagicVars.size(); ++i) {
-        if (i > 0) errs() << ", ";
+        if (i > 0)
+          errs() << ", ";
         errs() << L.MagicVars[i];
       }
       errs() << "]";
@@ -560,7 +749,7 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
     uint8_t Mask = 0;
     SmallVector<StringRef, 3> Parts;
     ValueStr.split(Parts, '|', -1, false);
-    
+
     for (StringRef Part : Parts) {
       Part = Part.trim();
       if (Part == "INT")
@@ -572,11 +761,12 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
       else if (Part == "NONE")
         Mask = SCHED_COMPUTE_NONE;
       else
-        errs() << "[SourceLabel] warning: unknown compute type '" << Part << "'\n";
+        errs() << "[SourceLabel] warning: unknown compute type '" << Part
+               << "'\n";
     }
     return Mask ? Mask : SCHED_COMPUTE_INT; // default to INT if nothing parsed
   }
-  
+
   if (Type == "memory-dense") {
     // Parse memory type: "STREAM", "RANDOM", "NONE"
     ValueStr = ValueStr.trim();
@@ -592,7 +782,7 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
       return 1;
     }
   }
-  
+
   // For other types, try to parse as integer
   unsigned Val;
   if (ValueStr.getAsInteger(0, Val)) {

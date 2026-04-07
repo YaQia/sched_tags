@@ -21,8 +21,12 @@ namespace sched_tag {
 //===----------------------------------------------------------------------===//
 
 struct SourceLabel {
-  std::string Type;           // e.g., "atomic-dense", "compute-dense"
-  Query QueryAST;             // Parsed SchedQL query
+  std::string Type;           // e.g., "atomic-dense", "compute-dense", "unshared"
+  Query QueryAST;             // Parsed SchedQL query (start position for ranged labels)
+  std::optional<Query> EndQueryAST;  // End position query (required for "unshared")
+                              // When present, QueryAST specifies start position
+                              // and EndQueryAST specifies end position.
+                              // For non-ranged labels, EndQueryAST is ignored.
   uint8_t Value;              // Value to store in the tag field:
                               // - For compute-dense: bitmask (INT|FLOAT|SIMD)
                               // - For memory-dense: STREAM(1) or RANDOM(2)
@@ -33,6 +37,13 @@ struct SourceLabel {
                               // names in the matched region and use their addresses
                               // for bloom filter computation (atomic_magic/unshared_magic).
                               // If empty, falls back to automatic detection (atomic ops).
+  
+  /// Check if this label requires precise range (start and end).
+  /// Currently only "unshared" requires this.
+  bool requiresRange() const { return Type == "unshared"; }
+  
+  /// Check if this label has an end query.
+  bool hasEndQuery() const { return EndQueryAST.has_value(); }
 };
 
 //===----------------------------------------------------------------------===//
@@ -78,12 +89,21 @@ private:
 // Query execution
 //===----------------------------------------------------------------------===//
 
-/// Execute a SchedQL query on a function.
+/// Execute a SchedQL query on a function (single query form).
 /// Returns a DensityResult containing matching instructions/regions.
 /// TypeMask is the value to store in the tag field (from label's "value" field).
 /// MagicVars specifies variable names to search for bloom filter computation.
 /// If MagicVars is empty, falls back to automatic detection of atomic operations.
 DensityResult executeQuery(llvm::Function &F, const Query &Q,
+                           llvm::FunctionAnalysisManager &AM,
+                           uint8_t TypeMask,
+                           llvm::ArrayRef<std::string> MagicVars = {});
+
+/// Execute a SchedQL ranged query on a function (start/end pair).
+/// Returns a DensityResult containing RangedRegions for precise range labeling.
+/// Used for labels like "unshared" where the scheduler needs exact boundaries.
+DensityResult executeQuery(llvm::Function &F,
+                           std::pair<const Query &, const Query &> StartEnd,
                            llvm::FunctionAnalysisManager &AM,
                            uint8_t TypeMask,
                            llvm::ArrayRef<std::string> MagicVars = {});

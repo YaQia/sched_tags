@@ -47,10 +47,13 @@ test/
 ├── test_dense.ll           # LLVM IR 输入: BB 级别计算密集区域 (INT / FLOAT / SIMD)
 ├── test_loops.ll           # LLVM IR 输入: 循环级别计算密集区域 + BB 回退
 ├── test_atomic.ll          # LLVM IR 输入: 原子指令密集区域 (BB / loop / mixed)
+├── test_source_labels.ll   # LLVM IR 输入: sched_tags.json 配置测试
 ├── test_rust_dense.rs      # Rust 源码: 计算密集测试 (编译为 .ll 后插桩)
+├── sched_tags_test.json    # 测试用 sched_tags.json 配置文件
 ├── reader.c                # C 运行时验证器: 配合 test_dense.ll（使用旧符号名）
 ├── reader_loops.c          # C 运行时验证器: 配合 test_loops.ll
 ├── reader_atomic.c         # C 运行时验证器: 配合 test_atomic.ll
+├── reader_source_labels.c  # C 运行时验证器: 配合 test_source_labels.ll
 ├── reader_rust.c           # C 运行时验证器: 配合 Rust 生成的 IR
 ├── reader_prctl.c          # prctl 构造函数测试
 ├── reader_obfuscated.c     # 使用动态符号查找的测试（推荐）
@@ -86,6 +89,18 @@ call 后密度比仍然超过阈值。
 | `test_atomic.ll` | `@atomic_loop_work` | 10        | 循环级别原子密集 SET (6 atomicrmw) |
 | `test_atomic.ll` | `@mixed_atomic_bb`  | 30        | 非密集循环 + 独立原子密集 BB       |
 | `test_atomic.ll` | `@trivial`          | (无)      | 无原子操作 → 不应被插桩            |
+
+#### 源标签 (source labels from sched_tags.json)
+
+| 文件                    | 函数                  | 观测点 ID | 测试目标                              |
+| ----------------------- | --------------------- | --------- | ------------------------------------- |
+| `test_source_labels.ll` | `@labeled_compute`    | 1         | BB 级别 compute-dense via source label |
+| `test_source_labels.ll` | `@labeled_atomic_loop`| 10        | 循环级别 atomic-dense via source label |
+| `test_source_labels.ll` | `@critical_section`   | 20, 21    | 精确范围 unshared SET/CLR (ranged)    |
+| `test_source_labels.ll` | `@another_critical`   | 30, 31    | 精确范围 unshared SET/CLR (ranged)    |
+| `test_source_labels.ll` | `@unlabeled_function` | 99        | 无源标签 → 标签状态保持（设计行为）   |
+| `test_source_labels.ll` | `@io_operation`       | 40        | io-dense via source label             |
+| `test_source_labels.ll` | `@branchy_code`       | 50        | branch-dense via source label         |
 
 ### `reader*.c` — 运行时验证器
 
@@ -171,6 +186,35 @@ clang /tmp/tagged_rust.o test/reader_rust.c -lm -o /tmp/test_rust
 # 5. 运行
 /tmp/test_rust
 ```
+
+### 测试 5: 源标签 (sched_tags.json)
+
+此测试验证从配置文件读取源标签的功能，包括：
+- 单查询标签 (compute-dense, atomic-dense, io-dense, branch-dense)
+- 精确范围标签 (unshared with start/end)
+- `func=` 谓词匹配调用目标
+
+```bash
+# 1. 用 pass 插桩（指定配置文件，禁用自动分析）
+opt -load-pass-plugin=build/pass/libSchedTagPass.so \
+    -passes=sched-tag \
+    -sched-tags-file=test/sched_tags_test.json \
+    -sched-auto-analysis=false \
+    test/test_source_labels.ll -o /tmp/tagged_source.bc
+
+# 2. bitcode → 目标文件
+llc /tmp/tagged_source.bc -filetype=obj -o /tmp/tagged_source.o
+
+# 3. 链接
+clang /tmp/tagged_source.o test/reader_source_labels.c -o /tmp/test_source
+
+# 4. 运行（退出码 0 = 通过）
+/tmp/test_source
+```
+
+**重要选项**：
+- `-sched-tags-file=<path>`: 指定 sched_tags.json 配置文件路径
+- `-sched-auto-analysis=false`: 禁用自动密度分析，仅使用源标签
 
 ## 流水线图解
 

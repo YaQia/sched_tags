@@ -1,0 +1,13 @@
+{
+    "labels": [
+        {
+            "type": "unshared",
+            "query": {
+                "start": "@worker/call[func=my_cross_process_lock]",
+                "end": "@worker/call[func=my_cross_process_unlock]"
+            },
+            "value": 3735928559,
+            "comment": "Test static magic number for cross-process locks"
+        }
+    ]
+}

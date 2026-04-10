@@ -58,7 +58,10 @@ SourceLabelResults SourceLabelAnalysis::run(Function &F,
 
   for (const auto &Label : GlobalLabels) {
     // Check if function name matches (exact or demangled)
-    if (!matchesFunctionName(F.getName(), Label.QueryAST.Function))
+    bool MatchStartFunc = matchesFunctionName(F.getName(), Label.QueryAST.Function);
+    bool MatchEndFunc = Label.hasEndQuery() && matchesFunctionName(F.getName(), Label.EndQueryAST->Function);
+
+    if (!MatchStartFunc && !MatchEndFunc)
       continue;
 
     // TODO: Check signature if specified
@@ -73,13 +76,13 @@ SourceLabelResults SourceLabelAnalysis::run(Function &F,
     if (Label.hasEndQuery()) {
       // Ranged query (e.g., unshared with start/end)
       MatchResult = executeQueryRange(F, Label);
-    } else if (Label.QueryAST.Tgt.Loop.has_value()) {
+    } else if (MatchStartFunc && Label.QueryAST.Tgt.Loop.has_value()) {
       // Loop-based query
       MatchResult = executeQueryLoop(F, Label, AM);
-    } else if (Label.QueryAST.Tgt.BB.has_value()) {
+    } else if (MatchStartFunc && Label.QueryAST.Tgt.BB.has_value()) {
       // Basic block query
       MatchResult = executeQueryBB(F, Label);
-    } else {
+    } else if (MatchStartFunc) {
       // Direct instruction query
       MatchResult = executeQueryInstruction(F, Label);
     }
@@ -514,6 +517,9 @@ DensityResult executeQueryRange(Function &F, const SourceLabel &Label) {
   const Query &StartQ = Label.QueryAST;
   const Query &EndQ = *Label.EndQueryAST;
 
+  bool MatchStartFunc = matchesFunctionName(F.getName(), StartQ.Function);
+  bool MatchEndFunc = matchesFunctionName(F.getName(), EndQ.Function);
+
   // Ranged queries only support direct instruction queries (not loop/bb)
   if (StartQ.Tgt.Loop.has_value() || StartQ.Tgt.BB.has_value()) {
     errs() << "[SourceLabel] warning: ranged queries only support direct "
@@ -526,46 +532,47 @@ DensityResult executeQueryRange(Function &F, const SourceLabel &Label) {
     return Result;
   }
 
-  auto StartInsts = findMatchingInstructions(F, StartQ.Tgt.Instruction);
-  auto EndInsts = findMatchingInstructions(F, EndQ.Tgt.Instruction);
-
-  // Pair start and end instructions by order
-  size_t NumPairs = std::min(StartInsts.size(), EndInsts.size());
-  if (StartInsts.size() != EndInsts.size()) {
-    errs() << "[SourceLabel] warning: mismatched start/end counts ("
-           << StartInsts.size() << " starts, " << EndInsts.size() << " ends), "
-           << "pairing " << NumPairs << "\n";
-  }
-
   bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
-  // Only atomic-dense should fallback to automatic atomic detection
   bool AllowFallback = (Label.Type == "atomic-dense");
 
-  for (size_t i = 0; i < NumPairs; ++i) {
-    RangedRegion RR;
-    RR.StartInst = StartInsts[i];
-    RR.EndInst = EndInsts[i];
-    RR.Value = Label.Value;
-    RR.StaticMagic = Label.StaticMagic;
+  if (MatchStartFunc) {
+    auto StartInsts = findMatchingInstructions(F, StartQ.Tgt.Instruction);
+    for (auto *Inst : StartInsts) {
+      RangeMarker RM;
+      RM.Inst = Inst;
+      RM.IsStart = true;
+      RM.Value = Label.Value;
+      RM.StaticMagic = Label.StaticMagic;
 
-    // Only collect base pointers if bloom filter is needed and no static magic is set
-    if (NeedsBloom && !RR.StaticMagic) {
-      SmallVector<BasicBlock *, 2> BBs;
-      BBs.push_back(RR.StartInst->getParent());
-      if (RR.EndInst->getParent() != RR.StartInst->getParent()) {
-        BBs.push_back(RR.EndInst->getParent());
+      if (NeedsBloom && !RM.StaticMagic) {
+        SmallVector<BasicBlock *, 1> BBs;
+        BBs.push_back(RM.Inst->getParent());
+        RM.BasePointers = collectMagicPointers(BBs, Label.MagicVars, F, AllowFallback);
       }
-      RR.BasePointers = collectMagicPointers(BBs, Label.MagicVars, F, AllowFallback);
+
+      Result.RangeMarkers.push_back(RM);
+
+      errs() << "[SourceLabel] matched ranged region: start="
+             << RM.Inst->getParent()->getName() << "/"
+             << RM.Inst->getOpcodeName()
+             << " (bases=" << RM.BasePointers.size() << ")\n";
     }
+  }
 
-    Result.RangedRegions.push_back(RR);
+  if (MatchEndFunc) {
+    auto EndInsts = findMatchingInstructions(F, EndQ.Tgt.Instruction);
+    for (auto *Inst : EndInsts) {
+      RangeMarker RM;
+      RM.Inst = Inst;
+      RM.IsStart = false;
+      RM.Value = 0; // Cleared
 
-    errs() << "[SourceLabel] matched ranged region: start="
-           << RR.StartInst->getParent()->getName() << "/"
-           << RR.StartInst->getOpcodeName()
-           << ", end=" << RR.EndInst->getParent()->getName() << "/"
-           << RR.EndInst->getOpcodeName()
-           << " (bases=" << RR.BasePointers.size() << ")\n";
+      Result.RangeMarkers.push_back(RM);
+
+      errs() << "[SourceLabel] matched ranged region: end="
+             << RM.Inst->getParent()->getName() << "/"
+             << RM.Inst->getOpcodeName() << "\n";
+    }
   }
 
   return Result;

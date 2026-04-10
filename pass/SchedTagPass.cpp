@@ -83,9 +83,8 @@ static void deduplicateRegions(DensityResult &Plan,
   }
 
   // Add all BBs covered by ranged regions
-  for (const auto &RR : SourcePlan.RangedRegions) {
-    MarkedBBs.insert(RR.StartInst->getParent());
-    MarkedBBs.insert(RR.EndInst->getParent());
+  for (const auto &RM : SourcePlan.RangeMarkers) {
+    MarkedBBs.insert(RM.Inst->getParent());
   }
 
   if (MarkedBBs.empty())
@@ -186,34 +185,39 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
            << " (bases=" << BR.BasePointers.size() << ")\n";
   }
 
-  // --- Ranged region instrumentation (e.g., unshared) ---
-  // For ranged regions, we emit:
-  //   - SET *before* StartInst (so scheduler sees the tag when blocking)
-  //   - CLR *after* EndInst (so scheduler knows resource is released)
-  for (auto &RR : Plan.RangedRegions) {
-    // SET before StartInst
-    {
-      IRBuilder<> Builder(RR.StartInst);
-      emitFieldStore(Builder, HintGV, FieldIdx, RR.Value);
+  // --- Range marker instrumentation (e.g., unshared) ---
+  // For range markers, we emit:
+  //   - SET *before* Inst if IsStart is true
+  //   - CLR *after* Inst if IsStart is false
+  for (auto &RM : Plan.RangeMarkers) {
+    if (RM.IsStart) {
+      // SET before Inst
+      IRBuilder<> Builder(RM.Inst);
+      emitFieldStore(Builder, HintGV, FieldIdx, RM.Value);
       if (EmitBloomMagic) {
-        if (RR.StaticMagic.has_value()) {
-          emitFieldStore(Builder, HintGV, MagicFieldIdx, *RR.StaticMagic);
+        if (RM.StaticMagic.has_value()) {
+          emitFieldStore(Builder, HintGV, MagicFieldIdx, *RM.StaticMagic);
         } else {
-          emitBloomMagicStore(Builder, HintGV, RR.BasePointers, MagicFieldIdx);
+          emitBloomMagicStore(Builder, HintGV, RM.BasePointers, MagicFieldIdx);
         }
       }
-    }
-    
-    // CLR after EndInst (store 0 to clear the tag)
-    {
-      // Insert after EndInst: get the next instruction
-      Instruction *InsertPoint = RR.EndInst->getNextNode();
+      Stats.RangedSets++;
+
+      std::string ValStr = NameFn ? NameFn(RM.Value) : std::to_string(RM.Value);
+      errs() << "[SchedTag]   RANGE SET  " << F.getName()
+             << "::" << RM.Inst->getParent()->getName() << "/"
+             << RM.Inst->getOpcodeName()
+             << " -> " << TagName << " " << ValStr
+             << " (bases=" << RM.BasePointers.size() << ")\n";
+    } else {
+      // CLR after Inst (store 0 to clear the tag)
+      Instruction *InsertPoint = RM.Inst->getNextNode();
       if (InsertPoint) {
         IRBuilder<> Builder(InsertPoint);
         emitFieldStore(Builder, HintGV, FieldIdx, 0);  // Clear tag
         if (EmitBloomMagic) {
           // Clear magic field too
-          if (RR.StaticMagic.has_value()) {
+          if (RM.StaticMagic.has_value()) {
             emitFieldStore(Builder, HintGV, MagicFieldIdx, 0); // Clear static magic
           } else {
             emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);  // Empty = 0
@@ -221,22 +225,24 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
         }
       } else {
         // EndInst is terminator, insert before it
-        // (This shouldn't normally happen for lock/unlock patterns)
         errs() << "[SchedTag] warning: EndInst is terminator, cannot insert CLR after\n";
+        IRBuilder<> Builder(RM.Inst);
+        emitFieldStore(Builder, HintGV, FieldIdx, 0);
+        if (EmitBloomMagic) {
+          if (RM.StaticMagic.has_value()) {
+            emitFieldStore(Builder, HintGV, MagicFieldIdx, 0);
+          } else {
+            emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);
+          }
+        }
       }
+      Stats.RangedSets++;
+      
+      errs() << "[SchedTag]   RANGE CLR  " << F.getName()
+             << "::" << RM.Inst->getParent()->getName() << "/"
+             << RM.Inst->getOpcodeName()
+             << " -> " << TagName << " 0\n";
     }
-    
-    Stats.RangedSets++;
-
-    std::string ValStr =
-        NameFn ? NameFn(RR.Value) : std::to_string(RR.Value);
-    errs() << "[SchedTag]   RANGE SET/CLR  " << F.getName()
-           << "::" << RR.StartInst->getParent()->getName() << "/"
-           << RR.StartInst->getOpcodeName() << " → "
-           << RR.EndInst->getParent()->getName() << "/"
-           << RR.EndInst->getOpcodeName()
-           << " -> " << TagName << " " << ValStr
-           << " (bases=" << RR.BasePointers.size() << ")\n";
   }
 
   return Stats;
@@ -325,9 +331,9 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
       CombinedSourcePlan.StandaloneBBs.append(
           SourceLabel.Regions.StandaloneBBs.begin(),
           SourceLabel.Regions.StandaloneBBs.end());
-      CombinedSourcePlan.RangedRegions.append(
-          SourceLabel.Regions.RangedRegions.begin(),
-          SourceLabel.Regions.RangedRegions.end());
+      CombinedSourcePlan.RangeMarkers.append(
+          SourceLabel.Regions.RangeMarkers.begin(),
+          SourceLabel.Regions.RangeMarkers.end());
     }
 
     // Then deduplicate automatic analyses against source labels

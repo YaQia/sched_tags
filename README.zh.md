@@ -8,6 +8,22 @@ cmake ..
 make -j$(nproc)
 ```
 
+## 使用方法
+
+使用 `clang` 编译时，通过 `-fpass-plugin` 加载编译出的 Pass 插件即可对 C/C++ 项目进行标签插桩。默认情况下，Pass 会读取当前目录下的 `sched_tags.json` 文件。
+
+```bash
+# 基本使用（以 C 语言为例）
+clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -c input.c -o output.o
+
+# 禁用 Pass 自动分析插桩
+# 如果只需要通过 sched_tags.json 显式配置标签，而不需要 Pass 自动去分析代码特征（如自动识别计算密集或原子操作等），
+# 可以传入 -mllvm -sched-auto-analysis=false 参数来禁用自动分析。
+clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -mllvm -sched-auto-analysis=false -c input.c -o output.o
+```
+
+> **注意**：不同操作系统下插件扩展名不同，Linux 下为 `.so`，macOS 下通常为 `.dylib`。
+
 ## 包含标签
 
 ### 1. 指令特性标签
@@ -44,3 +60,5 @@ make -j$(nproc)
 - [x] `func=name` 谓词（调用特定函数）
 - [x] `var=name` 谓词（使用特定变量）
 - [ ] 函数签名精确匹配
+- [ ] 实现基于后向支配树（Post-Dominator Tree）的模块级控制流分析，确保 `unshared` 等标签的 `start` 和 `end` 范围完全封闭，避免提前 `return` 或异常导致标签逃逸。
+- [ ] 处理异常展开（Exception Unwinding）时的标签清理（TLS 清空）。

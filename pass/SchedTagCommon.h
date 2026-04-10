@@ -91,10 +91,10 @@ struct BBRegion {
 /// 
 /// Unlike LoopRegion/BBRegion where the label persists until quiescent,
 /// RangedRegion labels are explicitly cleared at the end point.
-struct RangedRegion {
-  llvm::Instruction *StartInst;  // Instrumentation point for SET (before this inst)
-  llvm::Instruction *EndInst;    // Instrumentation point for CLR (after this inst)
-  uint8_t Value;               // Value to store in the tag payload field
+struct RangeMarker {
+  llvm::Instruction *Inst;  // Instrumentation point
+  bool IsStart;             // SET (true) or CLR (false)
+  uint8_t Value;            // Value to store in the tag payload field
   std::optional<uint64_t> StaticMagic; // Hardcoded magic number
 
   /// Base pointers for bloom filter computation.
@@ -105,10 +105,10 @@ struct RangedRegion {
 struct DensityResult {
   llvm::SmallVector<LoopRegion, 4> Loops;
   llvm::SmallVector<BBRegion, 8> StandaloneBBs;
-  llvm::SmallVector<RangedRegion, 4> RangedRegions;  // For unshared, etc.
+  llvm::SmallVector<RangeMarker, 4> RangeMarkers;  // For unshared, etc.
 
   bool empty() const { 
-    return Loops.empty() && StandaloneBBs.empty() && RangedRegions.empty(); 
+    return Loops.empty() && StandaloneBBs.empty() && RangeMarkers.empty(); 
   }
 };
 

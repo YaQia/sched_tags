@@ -248,6 +248,25 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
   return Stats;
 }
 
+void print_label(sched_tag::SourceLabel & L) {
+  errs() << "[SchedTag] loaded label: type=" << L.Type
+         << ", func=" << L.QueryAST.Function.Name;
+  if (L.hasEndQuery()) {
+    errs() << " (ranged: start→end)";
+  }
+  errs() << ", value=" << (int)L.Value;
+  if (!L.MagicVars.empty()) {
+    errs() << ", magic_vars=[";
+    for (size_t i = 0; i < L.MagicVars.size(); ++i) {
+      if (i > 0)
+        errs() << ", ";
+      errs() << L.MagicVars[i];
+    }
+    errs() << "]";
+  }
+  errs() << "\n";
+}
+
 //===----------------------------------------------------------------------===//
 // SchedTagPass::run — pure instrumentation, no analysis
 //===----------------------------------------------------------------------===//
@@ -256,15 +275,40 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
   // ---- Load source labels from sched_tags.json ----
-  auto SourceLabels = parseSchedTagsJSON(SchedTagsFile);
-  size_t NumLabels = SourceLabels.size();
-  if (!SourceLabels.empty()) {
-    SourceLabelAnalysis::setLabels(std::move(SourceLabels));
-    errs() << "[SchedTag] loaded " << NumLabels
-           << " source label(s) from " << SchedTagsFile << "\n";
+  auto AllSourceLabels = parseSchedTagsJSON(SchedTagsFile);
+  SmallVector<SourceLabel, 4> SourceLabels;
+  StringRef ModuleFileName = M.getSourceFileName();
+
+  for (auto &Label : AllSourceLabels) {
+    if (Label.Files.empty()) {
+      SourceLabels.push_back(std::move(Label));
+      print_label(Label);
+      continue;
+    }
+    
+    bool Matched = false;
+    for (const auto &File : Label.Files) {
+      if (ModuleFileName.contains(File)) {
+        Matched = true;
+        break;
+      }
+    }
+    
+    if (Matched) {
+      SourceLabels.push_back(std::move(Label));
+      print_label(Label);
+    }
   }
 
-  if (!SchedAutoAnalysis) {
+  size_t NumLabels = SourceLabels.size();
+  SourceLabelAnalysis::setLabels(std::move(SourceLabels));
+  if (NumLabels > 0) {
+    errs() << "[SchedTag] loaded " << NumLabels
+           << " source label(s) for module " << ModuleFileName
+           << " from " << SchedTagsFile << "\n";
+  }
+
+  if (!SchedAutoAnalysis && NumLabels > 0) {
     errs() << "[SchedTag] auto-analysis disabled, using source labels only\n";
   }
 
@@ -293,7 +337,6 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   }
 
   if (AllPlans.empty()) {
-    errs() << "[SchedTag] no dense regions found, skipping.\n";
     return PreservedAnalyses::all();
   }
 

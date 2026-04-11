@@ -22,6 +22,7 @@ namespace sched_tag {
 
 struct SourceLabel {
   std::string Type;           // e.g., "atomic-dense", "compute-dense", "unshared"
+  llvm::SmallVector<std::string, 4> Files; // Applicable files/directories
   Query QueryAST;             // Parsed SchedQL query (start position for ranged labels)
   std::optional<Query> EndQueryAST;  // End position query (required for "unshared")
                               // When present, QueryAST specifies start position

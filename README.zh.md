@@ -60,5 +60,6 @@ clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -mllvm -sched-auto-analysis=f
 - [x] `func=name` 谓词（调用特定函数）
 - [x] `var=name` 谓词（使用特定变量）
 - [ ] 函数签名精确匹配
+- [ ] `sched_tags.json` 中的 `files` 字段支持使用正则表达式匹配文件名或路径
 - [ ] 实现基于后向支配树（Post-Dominator Tree）的模块级控制流分析，确保 `unshared` 等标签的 `start` 和 `end` 范围完全封闭，避免提前 `return` 或异常导致标签逃逸。
 - [ ] 处理异常展开（Exception Unwinding）时的标签清理（TLS 清空）。

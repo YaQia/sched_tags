@@ -846,6 +846,20 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
 
     SourceLabel L;
     L.Type = Type->str();
+    
+    // Parse files array or string (optional)
+    if (const json::Value *FilesVal = LabelObj->get("files")) {
+      if (auto FilesStr = FilesVal->getAsString()) {
+        L.Files.push_back(FilesStr->str());
+      } else if (const json::Array *FilesArray = FilesVal->getAsArray()) {
+        for (const auto &FileVal : *FilesArray) {
+          if (auto FileStr = FileVal.getAsString()) {
+            L.Files.push_back(FileStr->str());
+          }
+        }
+      }
+    }
+
     L.QueryAST = ParsedQ->Start;
     L.EndQueryAST = ParsedQ->End;
     L.Value = Value;
@@ -861,23 +875,6 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
     }
 
     Labels.push_back(L);
-
-    errs() << "[SourceLabel] loaded label: type=" << L.Type
-           << ", func=" << L.QueryAST.Function.Name;
-    if (L.hasEndQuery()) {
-      errs() << " (ranged: start→end)";
-    }
-    errs() << ", value=" << (int)L.Value;
-    if (!L.MagicVars.empty()) {
-      errs() << ", magic_vars=[";
-      for (size_t i = 0; i < L.MagicVars.size(); ++i) {
-        if (i > 0)
-          errs() << ", ";
-        errs() << L.MagicVars[i];
-      }
-      errs() << "]";
-    }
-    errs() << "\n";
   }
 
   return Labels;

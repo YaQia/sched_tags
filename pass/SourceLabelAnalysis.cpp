@@ -243,20 +243,6 @@ findInstructionsInBB(BasicBlock &BB, const InstructionQuery &IQ) {
       }
       Matches = std::move(Filtered);
     }
-
-    // Handle position predicates
-    if (Pred.Pos.has_value()) {
-      switch (*Pred.Pos) {
-      case Position::First:
-        if (!Matches.empty())
-          Matches = {Matches.front()};
-        break;
-      case Position::Last:
-        if (!Matches.empty())
-          Matches = {Matches.back()};
-        break;
-      }
-    }
   }
 
   return Matches;
@@ -507,6 +493,23 @@ findMatchingInstructions(Function &F, const InstructionQuery &IQ) {
     auto Matches = findInstructionsInBB(BB, IQ);
     AllMatches.append(Matches.begin(), Matches.end());
   }
+
+  // Apply position predicates globally across the function
+  for (const auto &Pred : IQ.Predicates) {
+    if (Pred.Pos.has_value()) {
+      switch (*Pred.Pos) {
+      case Position::First:
+        if (!AllMatches.empty())
+          AllMatches = {AllMatches.front()};
+        break;
+      case Position::Last:
+        if (!AllMatches.empty())
+          AllMatches = {AllMatches.back()};
+        break;
+      }
+    }
+  }
+
   return AllMatches;
 }
 
@@ -664,25 +667,28 @@ DensityResult executeQueryInstruction(Function &F, const SourceLabel &Label) {
   bool NeedsBloom = labelNeedsBloomFilter(Label.Type);
   bool AllowFallback = (Label.Type == "atomic-dense");
 
-  for (BasicBlock &BB : F) {
-    auto Matches = findInstructionsInBB(BB, Label.QueryAST.Tgt.Instruction);
-    if (!Matches.empty()) {
-      BBRegion BR;
-      BR.BB = &BB;
-      BR.Value = Label.Value;
-      BR.StaticMagic = Label.StaticMagic;
+  auto Matches = findMatchingInstructions(F, Label.QueryAST.Tgt.Instruction);
+  SmallPtrSet<BasicBlock*, 8> SeenBBs;
 
-      // Only collect base pointers if bloom filter is needed and no static magic is set
-      if (NeedsBloom && !BR.StaticMagic) {
-        BasicBlock *BBPtr = &BB;
-        BR.BasePointers =
-            collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), Label.MagicVars, F, AllowFallback);
-      }
-      Result.StandaloneBBs.push_back(BR);
-      errs() << "[SourceLabel] found " << Matches.size()
-             << " matching instructions in BB " << BB.getName() << "\n";
+  for (Instruction *I : Matches) {
+    BasicBlock *BB = I->getParent();
+    if (!SeenBBs.insert(BB).second)
+      continue;
+
+    BBRegion BR;
+    BR.BB = BB;
+    BR.Value = Label.Value;
+    BR.StaticMagic = Label.StaticMagic;
+
+    // Only collect base pointers if bloom filter is needed and no static magic is set
+    if (NeedsBloom && !BR.StaticMagic) {
+      BasicBlock *BBPtr = BB;
+      BR.BasePointers =
+          collectMagicPointers(ArrayRef<BasicBlock *>(&BBPtr, 1), Label.MagicVars, F, AllowFallback);
     }
+    Result.StandaloneBBs.push_back(BR);
   }
+  errs() << "[SourceLabel] found matching instruction in function " << F.getName() << "\n";
 
   return Result;
 }

@@ -10,7 +10,37 @@ make -j$(nproc)
 
 ## 使用方法
 
-使用 `clang` 编译时，通过 `-fpass-plugin` 加载编译出的 Pass 插件即可对 C/C++ 项目进行标签插桩。默认情况下，Pass 会读取当前目录下的 `sched_tags.json` 文件。
+你可以通过 LLVM Pass 在编译期自动插桩，也可以直接在源码中引入头文件进行手动插桩。这两种方式可以混合使用，也可单独使用。
+
+### 方式一：源码级手动插桩 (Header-only)
+
+我们提供了一个轻量级的 C/C++ 头文件 `include/sched_tag.h`，它完全独立于 LLVM Pass。你只需要在代码中包含它，即可直接对代码块打上调度标签。它兼容原生的 GCC 和 Clang 编译器。
+
+```c
+#include "sched_tag.h"
+
+void process_data() {
+    // 1. 基础标签分配：进入区域前置1，离开前置0
+    sched_tag(UNSHARED, 1);
+    critical_logic();
+    sched_tag(UNSHARED, 0);
+
+    // 2. 带有变量依赖的共调度（计算指针地址的 Bloom Filter 魔数）
+    int my_mutex = 0;
+    sched_tag(UNSHARED, 1, &my_mutex);
+    critical_logic_with_lock();
+    sched_tag(UNSHARED, 0); // 离开时只需传入0即可自动清空魔数
+
+    // 3. 跨进程共调度（直接传递一个静态的 64 位整型 ID 作为魔数）
+    sched_tag(UNSHARED, 1, 0xDEADBEEF12345678ULL);
+    // ...
+    sched_tag(UNSHARED, 0);
+}
+```
+
+### 方式二：基于 LLVM Pass 的自动化插桩
+
+使用 `clang` 编译时，通过 `-fpass-plugin` 加载编译出的 Pass 插件即可对 C/C++ 项目进行无侵入式的标签插桩。默认情况下，Pass 会读取当前目录下的 `sched_tags.json` 文件。
 
 ```bash
 # 基本使用（以 C 语言为例）
@@ -53,7 +83,7 @@ clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -mllvm -sched-auto-analysis=f
 
 定义见[schedql.ebnf](./schedql.ebnf)
 
-### TODO List
+## TODO List
 
 - [ ] `loop[in=Type]` 模式
 - [ ] `loop[not_in=Type]` 模式

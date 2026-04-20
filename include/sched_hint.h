@@ -177,8 +177,13 @@ struct __attribute__((aligned(64))) sched_hint {
 };
 
 /* Compile-time size assertion: struct must be exactly 64 bytes              */
+#ifdef __cplusplus
+static_assert(sizeof(struct sched_hint) == 64,
+              "sched_hint must be exactly 64 bytes");
+#else
 _Static_assert(sizeof(struct sched_hint) == 64,
                "sched_hint must be exactly 64 bytes");
+#endif
 
 /*===----------------------------------------------------------------------===*\
 |* Access helpers                                                             *|

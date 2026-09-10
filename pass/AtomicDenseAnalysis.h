@@ -8,7 +8,7 @@
 // atomic RMW/CAS instructions (the MESI-traffic-generating subset).
 // Also collects base pointers for bloom-filter magic computation.
 // The analysis follows the same loop-first, BB-fallback strategy used by
-// ComputeDense.
+// ExecDense.
 //===----------------------------------------------------------------------===//
 
 #include "SchedTagCommon.h"

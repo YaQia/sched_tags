@@ -247,7 +247,7 @@ AtomicDense::Result AtomicDense::run(Function &F,
 
     LoopRegion LR;
     LR.Preheader = Preheader;
-    LR.Value = 1; // atomic_dense is a boolean flag
+    LR.Value = SCHED_ATOMIC_DENSE;
 
     // Get deduplicated exit blocks directly using LLVM's built-in method
     L->getUniqueExitBlocks(LR.ExitBlocks);
@@ -281,7 +281,7 @@ AtomicDense::Result AtomicDense::run(Function &F,
 
     BBRegion BR;
     BR.BB = &BB;
-    BR.Value = 1;
+    BR.Value = SCHED_ATOMIC_DENSE;
     BasicBlock *BBPtr = &BB;
     BR.BasePointers = collectBasePointers(ArrayRef<BasicBlock *>(&BBPtr, 1));
     Plan.StandaloneBBs.push_back(std::move(BR));

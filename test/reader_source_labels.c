@@ -3,7 +3,7 @@
  *                               from sched_tags.json configuration.
  *
  * This tests:
- *   1. Single query labels (compute-dense, atomic-dense, io-dense, branch-dense)
+ *   1. Single query labels (exec-dense, atomic-dense, load-trend)
  *   2. Ranged query labels (unshared with start/end)
  *   3. Proper SET/CLR behavior for ranged labels
  *
@@ -32,7 +32,6 @@ extern int labeled_atomic_loop(int n, int *counter);
 extern int critical_section(int x);
 extern int another_critical(int a, int b);
 extern int unlabeled_function(int n);
-extern void io_operation(void *buf, int size);
 extern int branchy_code(int x, int y);
 
 /* Mutex stubs - just track calls for testing */
@@ -52,12 +51,11 @@ void mutex_unlock(void *m) {
 /*=========================================================================*/
 
 struct hint_snapshot {
-    uint8_t compute_dense;
-    uint8_t branch_dense;
+    uint8_t exec_dense;
     uint8_t memory_dense;
     uint8_t atomic_dense;
-    uint8_t io_dense;
     uint8_t unshared;
+    uint8_t load_trend;
     uint64_t atomic_magic;
     uint64_t unshared_magic;
 };
@@ -68,12 +66,11 @@ static int snapshot_count = 0;
 void observe_hint(int tag_id) {
     struct sched_hint *h = &__sched_hint_data;
     if (tag_id < 100) {
-        snapshots[tag_id].compute_dense = h->compute_dense;
-        snapshots[tag_id].branch_dense = h->branch_dense;
+        snapshots[tag_id].exec_dense = h->exec_dense;
         snapshots[tag_id].memory_dense = h->memory_dense;
         snapshots[tag_id].atomic_dense = h->atomic_dense;
-        snapshots[tag_id].io_dense = h->io_dense;
         snapshots[tag_id].unshared = h->unshared;
+        snapshots[tag_id].load_trend = h->load_trend;
         snapshots[tag_id].atomic_magic = h->atomic_magic;
         snapshots[tag_id].unshared_magic = h->unshared_magic;
     }
@@ -86,23 +83,36 @@ void observe_hint(int tag_id) {
 
 static int failures = 0;
 
-static const char *compute_type_name(uint8_t mask) {
+static const char *exec_type_name(uint8_t mask) {
     if (mask == 0) return "NONE";
     static char buf[32];
     buf[0] = '\0';
-    if (mask & SCHED_COMPUTE_INT) strcat(buf, "INT");
-    if (mask & SCHED_COMPUTE_FLOAT) {
+    if (mask & SCHED_EXEC_INT) strcat(buf, "INT");
+    if (mask & SCHED_EXEC_FLOAT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "FLOAT");
     }
-    if (mask & SCHED_COMPUTE_SIMD) {
+    if (mask & SCHED_EXEC_SIMD) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "SIMD");
+    }
+    if (mask & SCHED_EXEC_CTRL) {
+        if (buf[0]) strcat(buf, "|");
+        strcat(buf, "CTRL");
     }
     return buf;
 }
 
-static void check_u8(const char *label, const char *field, 
+static const char *load_trend_name(uint8_t v) {
+    switch (v) {
+    case SCHED_LOAD_NONE:    return "NONE";
+    case SCHED_LOAD_RISING:  return "RISING";
+    case SCHED_LOAD_FALLING: return "FALLING";
+    default:                 return "?";
+    }
+}
+
+static void check_u8(const char *label, const char *field,
                      uint8_t expect, uint8_t actual) {
     int ok = (actual == expect);
     printf("  [%-40s] %s=%u  %s\n", label, field, actual, ok ? "OK" : "FAIL");
@@ -112,13 +122,24 @@ static void check_u8(const char *label, const char *field,
     }
 }
 
-static void check_compute(const char *label, uint8_t expect, uint8_t actual) {
+static void check_exec(const char *label, uint8_t expect, uint8_t actual) {
     int ok = (actual == expect);
-    printf("  [%-40s] compute=%s  %s\n", label, compute_type_name(actual), 
+    printf("  [%-40s] exec=%s  %s\n", label, exec_type_name(actual),
            ok ? "OK" : "FAIL");
     if (!ok) {
-        printf("    expected %s, got %s\n", 
-               compute_type_name(expect), compute_type_name(actual));
+        printf("    expected %s, got %s\n",
+               exec_type_name(expect), exec_type_name(actual));
+        failures++;
+    }
+}
+
+static void check_trend(const char *label, uint8_t expect, uint8_t actual) {
+    int ok = (actual == expect);
+    printf("  [%-40s] trend=%s  %s\n", label, load_trend_name(actual),
+           ok ? "OK" : "FAIL");
+    if (!ok) {
+        printf("    expected %s, got %s\n",
+               load_trend_name(expect), load_trend_name(actual));
         failures++;
     }
 }
@@ -146,12 +167,14 @@ int main(void) {
     snapshot_count = 0;
     
     /*---------------------------------------------------------------------*/
-    printf("--- Test 1: labeled_compute (compute-dense=INT via source label) ---\n");
+    printf("--- Test 1: labeled_compute (exec-dense=INT + load-trend=RISING) ---\n");
     /*---------------------------------------------------------------------*/
     int r1 = labeled_compute(10);
     printf("  result = %d\n", r1);
-    check_compute("inside labeled_compute (tag 1)", SCHED_COMPUTE_INT, 
-                  snapshots[1].compute_dense);
+    check_exec("inside labeled_compute (tag 1)", SCHED_EXEC_INT,
+               snapshots[1].exec_dense);
+    check_trend("inside labeled_compute (tag 1)", SCHED_LOAD_RISING,
+                snapshots[1].load_trend);
     printf("\n");
     
     /*---------------------------------------------------------------------*/
@@ -194,7 +217,7 @@ int main(void) {
     printf("--- Test 5: unlabeled_function (no source labels for this func) ---\n");
     /*---------------------------------------------------------------------*/
     /*
-     * NOTE: Non-ranged labels (compute-dense, atomic-dense, etc.) persist
+     * NOTE: Non-ranged labels (exec-dense, atomic-dense, etc.) persist
      * until quiescent (handled by scheduler), NOT until function return.
      * So previous labels may still be visible here. This is expected behavior.
      * 
@@ -203,31 +226,22 @@ int main(void) {
     int r5 = unlabeled_function(100);
     printf("  result = %d\n", r5);
     printf("  [note: non-ranged labels persist until quiescent]\n");
-    printf("  compute_dense=%u (may be non-zero from previous calls)\n",
-           snapshots[99].compute_dense);
+    printf("  exec_dense=%u (may be non-zero from previous calls)\n",
+           snapshots[99].exec_dense);
     printf("  atomic_dense=%u (may be non-zero from previous calls)\n",
            snapshots[99].atomic_dense);
     /* Only unshared should be 0 because it was explicitly cleared */
-    check_u8("unlabeled function (tag 99)", "unshared", 0, 
+    check_u8("unlabeled function (tag 99)", "unshared", 0,
              snapshots[99].unshared);
     printf("\n");
-    
+
     /*---------------------------------------------------------------------*/
-    printf("--- Test 6: io_operation (io-dense via source label) ---\n");
-    /*---------------------------------------------------------------------*/
-    char buf[64];
-    io_operation(buf, sizeof(buf));
-    check_u8("inside io_operation (tag 40)", "io_dense", 1, 
-             snapshots[40].io_dense);
-    printf("\n");
-    
-    /*---------------------------------------------------------------------*/
-    printf("--- Test 7: branchy_code (branch-dense via source label) ---\n");
+    printf("--- Test 7: branchy_code (exec-dense=CTRL via source label) ---\n");
     /*---------------------------------------------------------------------*/
     int r7 = branchy_code(5, 3);
     printf("  result = %d\n", r7);
-    check_u8("inside branchy_code (tag 50)", "branch_dense", 1, 
-             snapshots[50].branch_dense);
+    check_exec("inside branchy_code (tag 50)", SCHED_EXEC_CTRL,
+               snapshots[50].exec_dense);
     printf("\n");
     
     /*---------------------------------------------------------------------*/

@@ -1,10 +1,10 @@
 {
     "labels": [
         {
-            "type": "compute-dense",
+            "type": "exec-dense",
             "query": "@labeled_compute/call[first]",
             "value": "INT",
-            "comment": "Test 1: BB-level compute-dense via source label"
+            "comment": "Test 1: BB-level exec-dense via source label"
         },
         {
             "type": "atomic-dense",
@@ -31,31 +31,31 @@
             "comment": "Test 4: Another ranged unshared label"
         },
         {
-            "type": "io-dense",
-            "query": "@io_operation/call[first]",
-            "value": 1,
-            "comment": "Test 6: io-dense via source label"
+            "type": "load-trend",
+            "query": "@labeled_compute/call[first]",
+            "value": "RISING",
+            "comment": "Test 6: load-trend RISING via source label"
         },
         {
-            "type": "branch-dense",
+            "type": "exec-dense",
             "query": "@branchy_code/call[first]",
-            "value": 1,
-            "comment": "Test 7: branch-dense via source label"
+            "value": "CTRL",
+            "comment": "Test 7: exec-dense CTRL (control-flow heavy) via source label"
         },
         {
-            "type": "compute-dense",
+            "type": "exec-dense",
             "query": "@bb_test_entry/bb[entry]",
             "value": "INT",
             "comment": "Test 8: BB entry block query"
         },
         {
-            "type": "compute-dense",
+            "type": "exec-dense",
             "query": "@bb_test_contains/bb[contains=atomicrmw]",
             "value": "INT",
             "comment": "Test 9: BB contains atomicrmw query"
         },
         {
-            "type": "compute-dense",
+            "type": "exec-dense",
             "query": "@bb_test_combined/bb[entry;contains=call]",
             "value": "INT",
             "comment": "Test 10: BB combined patterns (entry + contains call)"

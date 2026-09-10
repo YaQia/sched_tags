@@ -844,7 +844,8 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
       Value = parseSymbolicValue(*Type, *ValStr);
     } else {
       // No value field: use default (1 for boolean, warn for others)
-      if (*Type == "compute-dense" || *Type == "memory-dense") {
+      if (*Type == "exec-dense" || *Type == "memory-dense" ||
+          *Type == "load-trend") {
         errs() << "[SourceLabel] warning: label type '" << *Type
                << "' requires a 'value' field, using default 1\n";
       }
@@ -887,31 +888,33 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
 }
 
 //===----------------------------------------------------------------------===//
-// Symbolic value parsing for compute-dense and memory-dense
+// Symbolic value parsing for exec-dense, memory-dense, load-trend
 //===----------------------------------------------------------------------===//
 
 static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
-  if (Type == "compute-dense") {
-    // Parse compute type: "INT", "FLOAT", "SIMD", "INT|FLOAT", etc.
+  if (Type == "exec-dense") {
+    // Parse exec type: "INT", "FLOAT", "SIMD", "CTRL", "INT|CTRL", etc.
     uint8_t Mask = 0;
-    SmallVector<StringRef, 3> Parts;
+    SmallVector<StringRef, 4> Parts;
     ValueStr.split(Parts, '|', -1, false);
 
     for (StringRef Part : Parts) {
       Part = Part.trim();
       if (Part == "INT")
-        Mask |= SCHED_COMPUTE_INT;
+        Mask |= SCHED_EXEC_INT;
       else if (Part == "FLOAT")
-        Mask |= SCHED_COMPUTE_FLOAT;
+        Mask |= SCHED_EXEC_FLOAT;
       else if (Part == "SIMD")
-        Mask |= SCHED_COMPUTE_SIMD;
+        Mask |= SCHED_EXEC_SIMD;
+      else if (Part == "CTRL")
+        Mask |= SCHED_EXEC_CTRL;
       else if (Part == "NONE")
-        Mask = SCHED_COMPUTE_NONE;
+        Mask = SCHED_EXEC_NONE;
       else
-        errs() << "[SourceLabel] warning: unknown compute type '" << Part
+        errs() << "[SourceLabel] warning: unknown exec type '" << Part
                << "'\n";
     }
-    return Mask ? Mask : SCHED_COMPUTE_INT; // default to INT if nothing parsed
+    return Mask ? Mask : SCHED_EXEC_INT; // default to INT if nothing parsed
   }
 
   if (Type == "memory-dense") {
@@ -927,6 +930,22 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
       errs() << "[SourceLabel] warning: unknown memory type '" << ValueStr
              << "', using STREAM\n";
       return 1;
+    }
+  }
+
+  if (Type == "load-trend") {
+    // Parse load trend: "RISING", "FALLING", "NONE"
+    ValueStr = ValueStr.trim();
+    if (ValueStr == "RISING")
+      return SCHED_LOAD_RISING;
+    else if (ValueStr == "FALLING")
+      return SCHED_LOAD_FALLING;
+    else if (ValueStr == "NONE")
+      return SCHED_LOAD_NONE;
+    else {
+      errs() << "[SourceLabel] warning: unknown load trend '" << ValueStr
+             << "', using RISING\n";
+      return SCHED_LOAD_RISING;
     }
   }
 

@@ -5,16 +5,24 @@
 # Build a loadable module (.so / .dylib) for use with opt's -load-pass-plugin
 add_library(SchedTagPass MODULE
   SchedTagCommon.cpp
-  ComputeDenseAnalysis.cpp
+  ExecDenseAnalysis.cpp
   AtomicDenseAnalysis.cpp
   SchedQLParser.cpp
   SourceLabelAnalysis.cpp
   SchedTagPass.cpp
 )
 
+# linux/sched_hint.h normally lives in the default sysroot (/usr/include/linux,
+# once the kernel headers are installed — or in mainline). Leave KERNEL_HEADERS
+# empty in that case. Only set it (e.g. -DKERNEL_HEADERS=<kernel>/usr/include)
+# when building against an as-yet-uninstalled custom kernel tree.
+set(KERNEL_HEADERS "" CACHE PATH
+    "Optional extra include dir holding linux/sched_hint.h (uninstalled kernel tree)")
+
 target_include_directories(SchedTagPass PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/include
+  ${KERNEL_HEADERS}
   ${LLVM_INCLUDE_DIRS}
 )
 

@@ -1,6 +1,7 @@
 #include "SchedTagCommon.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
@@ -28,19 +29,17 @@ StructType *getSchedHintType(LLVMContext &Ctx) {
                           {
                               I32,                    //  [0] magic
                               I32,                    //  [1] version
-                              I8,                     //  [2] compute_dense
-                              I8,                     //  [3] branch_dense
-                              I8,                     //  [4] memory_dense
-                              I8,                     //  [5] atomic_dense
-                              I8,                     //  [6] io_dense
-                              I8,                     //  [7] unshared
-                              I8,                     //  [8] compute_prep
-                              I8,                     //  [9] reserved_pad
-                              I64,                    // [10] atomic_magic
-                              I64,                    // [11] dep_magic
-                              I64,                    // [12] unshared_magic
-                              I8,                     // [13] dep_role
-                              ArrayType::get(I8, 23), // [14] reserved[23]
+                              I8,                     //  [2] exec_dense
+                              I8,                     //  [3] memory_dense
+                              I8,                     //  [4] atomic_dense
+                              I8,                     //  [5] unshared
+                              I8,                     //  [6] load_trend
+                              ArrayType::get(I8, 3),  //  [7] reserved[3]
+                              I64,                    //  [8] atomic_magic
+                              I64,                    //  [9] dep_magic
+                              I64,                    // [10] unshared_magic
+                              I8,                     // [11] dep_role
+                              ArrayType::get(I8, 23), // [12] reserved2[23]
                           },
                           "struct.sched_hint",
                           /*isPacked=*/false);
@@ -63,6 +62,36 @@ static constexpr const char *SYMBOL_NAME = "__sched_hint.data";
 GlobalVariable *getOrCreateSchedHintGV(Module &M) {
   LLVMContext &Ctx = M.getContext();
   StructType *HintTy = getSchedHintType(Ctx);
+
+  // Contract cross-check: the FIELD_* GEP indices must land on the same
+  // byte offsets as the C layout in include/sched_hint.h (and the kernel's
+  // include/linux/sched/hint.h). A struct-type edit that breaks the ABI is
+  // caught here at instrumentation time instead of silently writing tags
+  // into the wrong fields.
+  const StructLayout *SL = M.getDataLayout().getStructLayout(HintTy);
+  auto CheckOffset = [&](unsigned FieldIdx, uint64_t ExpectOff,
+                         const char *Name) {
+    if (SL->getElementOffset(FieldIdx) != ExpectOff) {
+      errs() << "[SchedTag] ABI BROKEN: " << Name << " (field " << FieldIdx
+             << ") is at byte offset "
+             << SL->getElementOffset(FieldIdx) << ", expected " << ExpectOff
+             << ". getSchedHintType() and SchedTagCommon.h FIELD_* are out"
+             << " of sync with sched_hint.h!\n";
+    }
+  };
+  CheckOffset(FIELD_EXEC_DENSE, 8, "exec_dense");
+  CheckOffset(FIELD_MEMORY_DENSE, 9, "memory_dense");
+  CheckOffset(FIELD_ATOMIC_DENSE, 10, "atomic_dense");
+  CheckOffset(FIELD_UNSHARED, 11, "unshared");
+  CheckOffset(FIELD_LOAD_TREND, 12, "load_trend");
+  CheckOffset(FIELD_ATOMIC_MAGIC, 16, "atomic_magic");
+  CheckOffset(FIELD_DEP_MAGIC, 24, "dep_magic");
+  CheckOffset(FIELD_UNSHARED_MAGIC, 32, "unshared_magic");
+  CheckOffset(FIELD_DEP_ROLE, 40, "dep_role");
+  if (SL->getSizeInBytes() != 64)
+    errs() << "[SchedTag] ABI BROKEN: struct.sched_hint size is "
+           << SL->getSizeInBytes() << " bytes, expected 64!\n";
+
   auto *I8 = Type::getInt8Ty(Ctx);
   auto *I32 = Type::getInt32Ty(Ctx);
   auto *I64 = Type::getInt64Ty(Ctx);
@@ -71,19 +100,17 @@ GlobalVariable *getOrCreateSchedHintGV(Module &M) {
       HintTy, {
                   ConstantInt::get(I32, SCHED_HINT_MAGIC),
                   ConstantInt::get(I32, SCHED_HINT_VERSION),
-                  ConstantInt::get(I8, SCHED_COMPUTE_NONE), // compute_dense
-                  ConstantInt::get(I8, 0),                  // branch_dense
-                  ConstantInt::get(I8, 0),                  // memory_dense
-                  ConstantInt::get(I8, 0),                  // atomic_dense
-                  ConstantInt::get(I8, 0),                  // io_dense
-                  ConstantInt::get(I8, 0),                  // unshared
-                  ConstantInt::get(I8, 0),                  // compute_prep
-                  ConstantInt::get(I8, 0),                  // reserved_pad
-                  ConstantInt::get(I64, 0),                 // atomic_magic
-                  ConstantInt::get(I64, 0),                 // dep_magic
-                  ConstantInt::get(I64, 0),                 // unshared_magic
-                  ConstantInt::get(I8, 0),                  // dep_role
-                  ConstantAggregateZero::get(ArrayType::get(I8, 23)), // reserved
+                  ConstantInt::get(I8, SCHED_EXEC_NONE),  // exec_dense
+                  ConstantInt::get(I8, 0),                // memory_dense
+                  ConstantInt::get(I8, 0),                // atomic_dense
+                  ConstantInt::get(I8, 0),                // unshared
+                  ConstantInt::get(I8, SCHED_LOAD_NONE),  // load_trend
+                  ConstantAggregateZero::get(ArrayType::get(I8, 3)),  // reserved
+                  ConstantInt::get(I64, 0),               // atomic_magic
+                  ConstantInt::get(I64, 0),               // dep_magic
+                  ConstantInt::get(I64, 0),               // unshared_magic
+                  ConstantInt::get(I8, 0),                // dep_role
+                  ConstantAggregateZero::get(ArrayType::get(I8, 23)), // reserved2
               });
 
   // Check if a global with this name already exists
@@ -93,7 +120,7 @@ GlobalVariable *getOrCreateSchedHintGV(Module &M) {
       Existing->setInitializer(Init);
       Existing->setLinkage(GlobalValue::WeakAnyLinkage);
       Existing->setThreadLocalMode(GlobalValue::InitialExecTLSModel);
-      Existing->setSection(SCHED_HINT_SECTION);
+      Existing->setSection(SCHED_HINT_SECTION_NAME);
       Existing->setAlignment(Align(64));
       appendToUsed(M, {Existing});
     }
@@ -106,7 +133,7 @@ GlobalVariable *getOrCreateSchedHintGV(Module &M) {
                                 SYMBOL_NAME);
 
   GV->setThreadLocalMode(GlobalValue::InitialExecTLSModel);
-  GV->setSection(SCHED_HINT_SECTION);
+  GV->setSection(SCHED_HINT_SECTION_NAME);
   GV->setAlignment(Align(64));
   appendToUsed(M, {GV});
   
@@ -344,34 +371,31 @@ collectBasePointers(ArrayRef<BasicBlock *> BBs,
 // getLabelTypeFieldIndex — Map label type string to field index
 //===----------------------------------------------------------------------===//
 
-std::pair<unsigned, bool> getLabelTypeFieldIndex(StringRef LabelType) {
+std::optional<std::pair<unsigned, bool>>
+getLabelTypeFieldIndex(StringRef LabelType) {
   // Returns {field_index, needs_bloom_filter}
-  
-  if (LabelType == "compute-dense")
-    return {FIELD_COMPUTE_DENSE, false};
-  
-  if (LabelType == "branch-dense")
-    return {FIELD_BRANCH_DENSE, false};
-  
+
+  if (LabelType == "exec-dense")
+    return std::make_pair(FIELD_EXEC_DENSE, false);
+
   if (LabelType == "memory-dense")
-    return {FIELD_MEMORY_DENSE, false};
-  
+    return std::make_pair(FIELD_MEMORY_DENSE, false);
+
   if (LabelType == "atomic-dense")
-    return {FIELD_ATOMIC_DENSE, true};   // bloom filter for atomic_magic
-  
-  if (LabelType == "io-dense")
-    return {FIELD_IO_DENSE, false};
-  
+    return std::make_pair(FIELD_ATOMIC_DENSE, true);   // bloom filter for atomic_magic
+
   if (LabelType == "unshared")
-    return {FIELD_UNSHARED, true};       // bloom filter for unshared_magic
-  
-  if (LabelType == "compute-prep")
-    return {FIELD_COMPUTE_PREP, false};
-  
-  // Unknown type - print warning and use atomic_dense as fallback
-  errs() << "[SchedTag] warning: unknown label type '" << LabelType
-         << "', defaulting to atomic-dense field\n";
-  return {FIELD_ATOMIC_DENSE, false};
+    return std::make_pair(FIELD_UNSHARED, true);       // bloom filter for unshared_magic
+
+  if (LabelType == "load-trend")
+    return std::make_pair(FIELD_LOAD_TREND, false);
+
+  // Unknown type: hard error. Silently guessing a field would corrupt an
+  // unrelated tag, so the caller must skip this label entirely.
+  errs() << "[SchedTag] error: unknown label type '" << LabelType
+         << "', skipping label (supported: exec-dense, memory-dense, "
+            "atomic-dense, unshared, load-trend)\n";
+  return std::nullopt;
 }
 
 } // namespace sched_tag

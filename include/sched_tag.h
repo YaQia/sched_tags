@@ -6,19 +6,19 @@
 |*                                                                            *|
 |* Usage Examples:                                                            *|
 |*   1. Basic tag assignment:                                                 *|
-|*      sched_tag(UNSHARED, 1);                                               *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_HELD);                             *|
 |*      critical_section();                                                   *|
-|*      sched_tag(UNSHARED, 0);                                               *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_NONE);                             *|
 |*                                                                            *|
 |*   2. Co-scheduling with a lock variable (Bloom Filter magic):              *|
-|*      sched_tag(UNSHARED, 1, &my_mutex);                                    *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_HELD, &my_mutex);                  *|
 |*      ...                                                                   *|
-|*      sched_tag(UNSHARED, 0);                                               *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_NONE);                             *|
 |*                                                                            *|
 |*   3. Cross-process co-scheduling with a Static Magic Number:               *|
-|*      sched_tag(UNSHARED, 1, 0xDEADBEEF12345678ULL);                        *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_HELD, 0xDEADBEEF12345678ULL);      *|
 |*      ...                                                                   *|
-|*      sched_tag(UNSHARED, 0);                                               *|
+|*      sched_tag(UNSHARED, SCHED_UNSHARED_NONE);                             *|
 |*                                                                            *|
 \*===----------------------------------------------------------------------===*/
 
@@ -45,8 +45,9 @@ __attribute__((section("__sched_hint"), weak, tls_model("initial-exec")))
 __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data") = {
     SCHED_HINT_MAGIC,
     SCHED_HINT_VERSION,
-    0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, {0}
+    0, 0, 0, 0, 0, {0, 0, 0},
+    0, 0, 0,
+    0, {0}
 };
 
 #ifndef PR_SET_SCHED_HINT_OFFSET
@@ -76,21 +77,22 @@ void __sched_tag_init_prctl(void) {
 
 /* Tag types corresponding to sched_hint fields */
 typedef enum {
-    COMPUTE_DENSE,
-    BRANCH_DENSE,
+    EXEC_DENSE,
     MEMORY_DENSE,
     ATOMIC_DENSE,
-    IO_DENSE,
     UNSHARED,
-    COMPUTE_PREP
+    LOAD_TREND
 } sched_tag_type_t;
 
-/* Bloom filter hash calculation (identical to LLVM pass logic) */
-static inline void __sched_tag_bloom_add(uint64_t *bloom, const void *ptr) {
+/* Bloom filter hash calculation (identical to LLVM pass logic).
+ * Takes __u64* to match the struct sched_hint magic fields exactly (the uapi
+ * header uses __u64 == unsigned long long, which is a distinct pointer type
+ * from uint64_t on LP64 even though the width matches). */
+static inline void __sched_tag_bloom_add(__u64 *bloom, const void *ptr) {
     if (!ptr) return;
     uint64_t addr = (uint64_t)(uintptr_t)ptr;
     addr &= ~63ULL; /* align to 64 bytes */
-    uint64_t h = addr * 0x9E3779B97F4A7C15ULL; /* fibonacci hashing */
+    uint64_t h = addr * SCHED_HINT_BLOOM_PRIME; /* single-source hash constant */
     *bloom |= (1ULL << (h & 63))
            |  (1ULL << ((h >> 16) & 63))
            |  (1ULL << ((h >> 32) & 63))
@@ -101,13 +103,11 @@ static inline void __sched_tag_bloom_add(uint64_t *bloom, const void *ptr) {
 static inline void __sched_tag_set_base(sched_tag_type_t type, uint8_t value) {
     struct sched_hint *hint = &__sched_hint_data;
     switch (type) {
-        case COMPUTE_DENSE: hint->compute_dense = value; break;
-        case BRANCH_DENSE:  hint->branch_dense  = value; break;
+        case EXEC_DENSE:    hint->exec_dense    = value; break;
         case MEMORY_DENSE:  hint->memory_dense  = value; break;
         case ATOMIC_DENSE:  hint->atomic_dense  = value; if (!value) hint->atomic_magic = 0; break;
-        case IO_DENSE:      hint->io_dense      = value; break;
         case UNSHARED:      hint->unshared      = value; if (!value) hint->unshared_magic = 0; break;
-        case COMPUTE_PREP:  hint->compute_prep  = value; break;
+        case LOAD_TREND:    hint->load_trend    = value; break;
     }
 }
 

@@ -1,4 +1,4 @@
-#include "ComputeDenseAnalysis.h"
+#include "ExecDenseAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -11,7 +11,7 @@ using namespace llvm;
 namespace sched_tag {
 
 //===----------------------------------------------------------------------===//
-// Thresholds (compute-dense specific)
+// Thresholds (exec-dense specific)
 //===----------------------------------------------------------------------===//
 
 static constexpr unsigned MIN_BB_SIZE = 10;
@@ -19,21 +19,34 @@ static constexpr unsigned MIN_LOOP_SIZE = 10;
 static constexpr double LOOP_DENSE_THRESHOLD = 0.5;
 static constexpr double BB_DENSE_THRESHOLD = 0.7;
 
-// Minimum fraction of compute instructions a single type must represent
+// Minimum fraction of arithmetic instructions a single type must represent
 // before its bit is set in the bitmask.
 static constexpr double PER_TYPE_THRES = 0.25;
+
+// Minimum fraction of branch instructions (conditional br / switch /
+// indirectbr) for the CTRL bit. In LLVM IR only a terminator can branch,
+// so a basic block contributes at most one; density therefore measures
+// "short blocks chained by decisions" — the classic branchy profile.
+static constexpr double CTRL_DENSE_THRESHOLD = 0.08;
 
 //===----------------------------------------------------------------------===//
 // Per-instruction classification
 //===----------------------------------------------------------------------===//
 
-ComputeOpType computeOpType(Instruction &I) {
+ExecOpType execOpType(Instruction &I) {
+  // Control-flow pressure: conditional branches and multi-way branches.
+  // An unconditional br is straight-line flow, not a decision.
+  if (auto *BI = dyn_cast<BranchInst>(&I))
+    return BI->isConditional() ? ExecOpType::CTRL : ExecOpType::NONE;
+  if (isa<SwitchInst>(I) || isa<IndirectBrInst>(I))
+    return ExecOpType::CTRL;
+
   // Exclude non-compute instructions.
   // Use CallBase to cover both CallInst and InvokeInst (C++/Rust exceptions)
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<PHINode>(I) ||
       isa<SelectInst>(I) || isa<AllocaInst>(I) || I.isTerminator() ||
       isa<CallBase>(I))
-    return ComputeOpType::NONE;
+    return ExecOpType::NONE;
 
   bool isIntOp = false, isFloatOp = false;
   switch (I.getOpcode()) {
@@ -78,10 +91,10 @@ ComputeOpType computeOpType(Instruction &I) {
   case Instruction::ExtractElement:
   case Instruction::InsertElement:
   case Instruction::ShuffleVector:
-    return ComputeOpType::SIMD;
+    return ExecOpType::SIMD;
 
   default:
-    return ComputeOpType::NONE;
+    return ExecOpType::NONE;
   }
 
   // Vector operands -> SIMD regardless of opcode category.
@@ -90,52 +103,63 @@ ComputeOpType computeOpType(Instruction &I) {
         return U->getType()->isVectorTy();
       });
   if (isVector)
-    return ComputeOpType::SIMD;
+    return ExecOpType::SIMD;
 
   if (isIntOp)
-    return ComputeOpType::INT;
+    return ExecOpType::INT;
   if (isFloatOp)
-    return ComputeOpType::FLOAT;
-  return ComputeOpType::NONE;
+    return ExecOpType::FLOAT;
+  return ExecOpType::NONE;
 }
 
 //===----------------------------------------------------------------------===//
-// Helper: classify from (IntCnt, FloatCnt, SIMDCnt, Total) + threshold
+// Helper: classify from counts + threshold
 //===----------------------------------------------------------------------===//
 
-/// Return a bitmask of SCHED_COMPUTE_* bits.
-/// 1. The combined compute ratio (INT+FLOAT+SIMD)/Total must meet Threshold.
-/// 2. Each individual type must represent >= max(PER_TYPE_THRES, Threshold) of
-///    compute instructions to earn its bit.
+/// Return a bitmask of SCHED_EXEC_* bits.
+///
+/// - The CTRL bit is set independently of the arithmetic gate: a branchy
+///   region with little arithmetic is exactly the CTRL-only profile the
+///   SMT scheduler wants to spread across cores.
+/// - The arithmetic bits (INT/FLOAT/SIMD) require the combined arithmetic
+///   ratio to meet Threshold; each individual type must then represent
+///   >= max(PER_TYPE_THRES, Threshold / 3) of arithmetic instructions to
+///   earn its bit.
 static uint8_t classifyFromCounts(uint32_t IntCnt, uint32_t FloatCnt,
-                                  uint32_t SIMDCnt, uint32_t Total,
-                                  double Threshold) {
+                                  uint32_t SIMDCnt, uint32_t CTRLCnt,
+                                  uint32_t Total, double Threshold) {
   if (Total == 0)
-    return SCHED_COMPUTE_NONE;
-
-  uint32_t ComputeTotal = IntCnt + FloatCnt + SIMDCnt;
-  if (static_cast<double>(ComputeTotal) / Total < Threshold)
-    return SCHED_COMPUTE_NONE;
+    return SCHED_EXEC_NONE;
 
   uint8_t Mask = 0;
-  double CT = static_cast<double>(ComputeTotal);
-  if (IntCnt > 0 && IntCnt / CT >= std::max(PER_TYPE_THRES, Threshold / 3))
-    Mask |= SCHED_COMPUTE_INT;
-  if (FloatCnt > 0 && FloatCnt / CT >= std::max(PER_TYPE_THRES, Threshold / 3))
-    Mask |= SCHED_COMPUTE_FLOAT;
-  if (SIMDCnt > 0 && SIMDCnt / CT >= std::max(PER_TYPE_THRES, Threshold / 3))
-    Mask |= SCHED_COMPUTE_SIMD;
+
+  if (CTRLCnt > 0 &&
+      static_cast<double>(CTRLCnt) / Total >= CTRL_DENSE_THRESHOLD)
+    Mask |= SCHED_EXEC_CTRL;
+
+  uint32_t ArithTotal = IntCnt + FloatCnt + SIMDCnt;
+  if (static_cast<double>(ArithTotal) / Total >= Threshold) {
+    double AT = static_cast<double>(ArithTotal);
+    if (IntCnt > 0 && IntCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
+      Mask |= SCHED_EXEC_INT;
+    if (FloatCnt > 0 &&
+        FloatCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
+      Mask |= SCHED_EXEC_FLOAT;
+    if (SIMDCnt > 0 &&
+        SIMDCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
+      Mask |= SCHED_EXEC_SIMD;
+  }
   return Mask;
 }
 
 //===----------------------------------------------------------------------===//
-// ComputeDense::run — unified density analysis
+// ExecDense::run — unified density analysis
 //===----------------------------------------------------------------------===//
 
-AnalysisKey ComputeDense::Key;
+AnalysisKey ExecDense::Key;
 
-ComputeDense::Result ComputeDense::run(Function &F,
-                                       FunctionAnalysisManager &FAM) {
+ExecDense::Result ExecDense::run(Function &F,
+                                 FunctionAnalysisManager &FAM) {
   DensityResult Plan;
 
   //--- Step 1: Single pass — cache per-BB instruction counts ---------------
@@ -145,6 +169,7 @@ ComputeDense::Result ComputeDense::run(Function &F,
     uint32_t IntCnt = 0;
     uint32_t FloatCnt = 0;
     uint32_t SIMDCnt = 0;
+    uint32_t CTRLCnt = 0;
   };
 
   DenseMap<BasicBlock *, BBCounts> BBStats;
@@ -153,15 +178,18 @@ ComputeDense::Result ComputeDense::run(Function &F,
     BBCounts C;
     for (Instruction &I : BB) {
       C.Total++;
-      switch (computeOpType(I)) {
-      case ComputeOpType::INT:
+      switch (execOpType(I)) {
+      case ExecOpType::INT:
         C.IntCnt++;
         break;
-      case ComputeOpType::FLOAT:
+      case ExecOpType::FLOAT:
         C.FloatCnt++;
         break;
-      case ComputeOpType::SIMD:
+      case ExecOpType::SIMD:
         C.SIMDCnt++;
+        break;
+      case ExecOpType::CTRL:
+        C.CTRLCnt++;
         break;
       default:
         break;
@@ -195,7 +223,7 @@ ComputeDense::Result ComputeDense::run(Function &F,
       continue;
 
     // Aggregate counts from cached per-BB stats.
-    uint32_t Total = 0, IntCnt = 0, FloatCnt = 0, SIMDCnt = 0;
+    uint32_t Total = 0, IntCnt = 0, FloatCnt = 0, SIMDCnt = 0, CTRLCnt = 0;
     for (BasicBlock *BB : L->getBlocks()) {
       auto It = BBStats.find(BB);
       if (It == BBStats.end())
@@ -205,6 +233,7 @@ ComputeDense::Result ComputeDense::run(Function &F,
       IntCnt += C.IntCnt;
       FloatCnt += C.FloatCnt;
       SIMDCnt += C.SIMDCnt;
+      CTRLCnt += C.CTRLCnt;
     }
 
     if (Total < MIN_LOOP_SIZE) {
@@ -213,9 +242,9 @@ ComputeDense::Result ComputeDense::run(Function &F,
       continue;
     }
 
-    uint8_t LoopMask = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt, Total,
-                                          LOOP_DENSE_THRESHOLD);
-    if (LoopMask == SCHED_COMPUTE_NONE) {
+    uint8_t LoopMask = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt, CTRLCnt,
+                                          Total, LOOP_DENSE_THRESHOLD);
+    if (LoopMask == SCHED_EXEC_NONE) {
       for (Loop *Sub : L->getSubLoops())
         Worklist.push_back(Sub);
       continue;
@@ -253,8 +282,8 @@ ComputeDense::Result ComputeDense::run(Function &F,
       continue;
 
     uint8_t BBMask = classifyFromCounts(C.IntCnt, C.FloatCnt, C.SIMDCnt,
-                                        C.Total, BB_DENSE_THRESHOLD);
-    if (BBMask == SCHED_COMPUTE_NONE)
+                                        C.CTRLCnt, C.Total, BB_DENSE_THRESHOLD);
+    if (BBMask == SCHED_EXEC_NONE)
       continue;
 
     Plan.StandaloneBBs.push_back({&BB, BBMask});

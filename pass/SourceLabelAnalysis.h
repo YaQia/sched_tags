@@ -6,7 +6,7 @@
 //
 // Reads sched_tags.json from the module directory and executes SchedQL
 // queries to locate specific IR instructions/regions that should be tagged.
-// Complements the automatic density analyses (ComputeDense, AtomicDense).
+// Complements the automatic density analyses (ExecDense, AtomicDense).
 //===----------------------------------------------------------------------===//
 
 #include "SchedQLParser.h"
@@ -21,7 +21,7 @@ namespace sched_tag {
 //===----------------------------------------------------------------------===//
 
 struct SourceLabel {
-  std::string Type;           // e.g., "atomic-dense", "compute-dense", "unshared"
+  std::string Type;           // e.g., "atomic-dense", "exec-dense", "unshared"
   llvm::SmallVector<std::string, 4> Files; // Applicable files/directories
   Query QueryAST;             // Parsed SchedQL query (start position for ranged labels)
   std::optional<Query> EndQueryAST;  // End position query (required for "unshared")
@@ -29,8 +29,9 @@ struct SourceLabel {
                               // and EndQueryAST specifies end position.
                               // For non-ranged labels, EndQueryAST is ignored.
   uint8_t Value;              // Value to store in the tag field:
-                              // - For compute-dense: bitmask (INT|FLOAT|SIMD)
+                              // - For exec-dense: bitmask (INT|FLOAT|SIMD|CTRL)
                               // - For memory-dense: STREAM(1) or RANDOM(2)
+                              // - For load-trend: RISING(1) or FALLING(2)
                               // - For boolean fields: 1 (or 0 to disable)
                               // Default: 1
   std::optional<uint64_t> StaticMagic; // Hardcoded magic number (overrides bloom filter)
@@ -55,7 +56,7 @@ struct SourceLabel {
 /// Result structure that preserves the label type for each region.
 /// This allows the pass to correctly map label types to struct sched_hint fields.
 struct SourceLabelResult {
-  std::string LabelType;      // e.g., "atomic-dense", "branch-dense"
+  std::string LabelType;      // e.g., "atomic-dense", "exec-dense"
   DensityResult Regions;      // Regions matched by this label's query
 };
 

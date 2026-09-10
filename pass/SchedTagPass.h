@@ -6,7 +6,7 @@
 //                  and inserts runtime hint stores.
 //
 // This pass:
-//   1. Runs per-function density analyses (ComputeDense, AtomicDense, ...).
+//   1. Runs per-function density analyses (ExecDense, AtomicDense, ...).
 //   2. Creates the TLS global @__sched_hint_data (magic + version header).
 //   3. Emits a module constructor to register the TLS offset via prctl().
 //   4. Instruments dense region boundaries with SET / CLR stores to

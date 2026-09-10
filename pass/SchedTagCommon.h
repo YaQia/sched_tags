@@ -6,6 +6,11 @@
 //                    used by all sched-tag analysis and instrumentation passes.
 //===----------------------------------------------------------------------===//
 
+// Single source of truth for the sched_hint ABI: struct, enums, magic,
+// version, and bloom parameters. Installed via `make headers_install`; the
+// build adds the kernel's uapi include dir to the search path.
+#include <linux/sched_hint.h>
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -15,47 +20,50 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
+#include <optional>
+#include <utility>
 
 namespace sched_tag {
 using namespace llvm;
 
 //===----------------------------------------------------------------------===//
-// Constants — must match sched_hint.h exactly
+// Constants
+//
+// The ABI scalars (SCHED_HINT_MAGIC/VERSION, SCHED_EXEC_*, SCHED_MEMORY_*,
+// SCHED_LOAD_*, SCHED_ATOMIC_*, SCHED_UNSHARED_*, SCHED_DEP_*) and the bloom
+// parameters (SCHED_HINT_BLOOM_PRIME/K) come from <linux/sched_hint.h> above.
+//
+// Pass-local: the section name and prctl number (linker/syscall glue, not part
+// of the on-page struct), and the FIELD_* GEP indices + LLVM struct type in
+// getSchedHintType() — these cannot be derived from the C struct and are
+// guarded at instrumentation time by the DataLayout cross-check.
 //===----------------------------------------------------------------------===//
 
-static constexpr uint32_t SCHED_HINT_MAGIC = 0x5348494EU;
-static constexpr uint32_t SCHED_HINT_VERSION = 1;
-static constexpr const char *SCHED_HINT_SECTION = "__sched_hint";
-static constexpr int PR_SET_SCHED_HINT_OFFSET = 83;
+static constexpr const char *SCHED_HINT_SECTION_NAME = "__sched_hint";
+#ifndef PR_SET_SCHED_HINT_OFFSET
+#define PR_SET_SCHED_HINT_OFFSET 83
+#endif
 
-// Compute-dense sub-type bitmask.
-static constexpr uint8_t SCHED_COMPUTE_NONE = 0;
-static constexpr uint8_t SCHED_COMPUTE_INT = 1U << 0;
-static constexpr uint8_t SCHED_COMPUTE_FLOAT = 1U << 1;
-static constexpr uint8_t SCHED_COMPUTE_SIMD = 1U << 2;
+// Bloom aliases so existing code keeps its short names; values come from the
+// shared ABI header (single source).
+static constexpr unsigned K_BLOOM_BITS = SCHED_HINT_BLOOM_K;
+static constexpr uint64_t BLOOM_HASH_PRIME = SCHED_HINT_BLOOM_PRIME;
 
 // Struct field indices (must match getSchedHintType layout).
 // Header: magic(0), version(1)
-// Tag payloads starting at offset 2:
-static constexpr unsigned FIELD_COMPUTE_DENSE = 2; // offset 8  (i8)
-static constexpr unsigned FIELD_BRANCH_DENSE = 3;  // offset 9  (i8)
-static constexpr unsigned FIELD_MEMORY_DENSE = 4;  // offset 10 (i8)
-static constexpr unsigned FIELD_ATOMIC_DENSE = 5;  // offset 11 (i8)
-static constexpr unsigned FIELD_IO_DENSE = 6;      // offset 12 (i8)
-static constexpr unsigned FIELD_UNSHARED = 7;      // offset 13 (i8)
-static constexpr unsigned FIELD_COMPUTE_PREP = 8;  // offset 14 (i8)
+// Payload: exec_dense(2), memory_dense(3), atomic_dense(4), unshared(5),
+//          load_trend(6), reserved[3](7)
+static constexpr unsigned FIELD_EXEC_DENSE = 2;     // offset 8  (i8)
+static constexpr unsigned FIELD_MEMORY_DENSE = 3;   // offset 9  (i8)
+static constexpr unsigned FIELD_ATOMIC_DENSE = 4;   // offset 10 (i8)
+static constexpr unsigned FIELD_UNSHARED = 5;       // offset 11 (i8)
+static constexpr unsigned FIELD_LOAD_TREND = 6;     // offset 12 (i8)
+static constexpr unsigned FIELD_RESERVED = 7;       // offset 13 ([3 x i8])
 // Extended payloads:
-static constexpr unsigned FIELD_ATOMIC_MAGIC = 10;   // offset 16 (i64)
-static constexpr unsigned FIELD_DEP_MAGIC = 11;      // offset 24 (i64)
-static constexpr unsigned FIELD_UNSHARED_MAGIC = 12; // offset 32 (i64)
-static constexpr unsigned FIELD_DEP_ROLE = 13;       // offset 40 (i8)
-
-// Bloom filter parameters for atomic_magic (register-width bloom filter).
-// Each pointer address sets K_BLOOM_BITS bit-positions in a 64-bit word.
-// The scheduler detects overlap via: popcount(magic_a & magic_b) >=
-// K_BLOOM_BITS.
-static constexpr unsigned K_BLOOM_BITS = 4;
-static constexpr uint64_t BLOOM_HASH_PRIME = 0x9E3779B97F4A7C15ULL; // fibonacci
+static constexpr unsigned FIELD_ATOMIC_MAGIC = 8;   // offset 16 (i64)
+static constexpr unsigned FIELD_DEP_MAGIC = 9;      // offset 24 (i64)
+static constexpr unsigned FIELD_UNSHARED_MAGIC = 10; // offset 32 (i64)
+static constexpr unsigned FIELD_DEP_ROLE = 11;      // offset 40 (i8)
 
 //===----------------------------------------------------------------------===//
 // Analysis result types — the "instrumentation plan"
@@ -130,9 +138,11 @@ llvm::GlobalVariable *getOrCreateSchedHintGV(llvm::Module &M);
 void emitPrctlConstructor(llvm::Module &M, llvm::GlobalVariable *HintGV);
 
 /// Map a label type string to its corresponding struct field index.
-/// Returns the field index and a boolean indicating if bloom filter is needed.
-/// Returns {0, false} for unknown types (will print a warning).
-std::pair<unsigned, bool> getLabelTypeFieldIndex(llvm::StringRef LabelType);
+/// Returns {field index, needs bloom filter}, or std::nullopt for unknown
+/// types. Unknown types are a configuration error and must cause the label
+/// to be skipped loudly — never guess a field.
+std::optional<std::pair<unsigned, bool>>
+getLabelTypeFieldIndex(llvm::StringRef LabelType);
 
 /// Generic helper: emit a store to a tag payload field.
 ///

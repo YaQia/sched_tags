@@ -105,18 +105,18 @@ entry:
 }
 
 ;; ==========================================================================
-;; Test 6: io-dense label via source label
+;; io_operation: previously the io-dense test target (tag removed — the
+;; scheduler observes I/O blocking behavior directly at runtime)
 ;; ==========================================================================
 
 define void @io_operation(ptr %buf, i32 %size) {
 entry:
-  ; This will be marked as io-dense via source label
   call void @observe_hint(i32 40)
   ret void
 }
 
 ;; ==========================================================================
-;; Test 7: branch-dense label via source label  
+;; Test 7: exec-dense CTRL label via source label
 ;; ==========================================================================
 
 define i32 @branchy_code(i32 %x, i32 %y) {

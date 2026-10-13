@@ -1,5 +1,17 @@
 # 标签化调度优化器
 
+## 命名约定
+
+项目里 `sched_hint` / `sched_tag` / `label` 三个词各指一层，不是混用：
+
+| 词 | 层 | 含义 | 例 |
+|---|---|---|---|
+| **hint** | 内核机制 / ABI | 载体。内核只搬运不透明的 64 字节提示块，不知道"标签"为何物 | `struct sched_hint`、`PR_SET_SCHED_HINT`、`sched_hint_current()` |
+| **tag** | 运行时标注 | 行为。开发者或 Pass 往载体里写的内容 | `sched_tag_set()`、`SchedTagPass`、`sched_tags.json` |
+| **label** | 静态配置 | 声明。`sched_tags.json` 里一条"在哪打什么 tag"的描述 | `SourceLabelAnalysis`、JSON label schema |
+
+规则：**越靠近内核越用 hint，越靠近开发者越用 tag，配置文件里的条目叫 label**。新增命名时先问自己在哪一层。
+
 ## 编译
 
 ```bash
@@ -29,20 +41,20 @@ cmake --build build -j$(nproc)
 
 void process_data() {
     // 1. 基础标签分配：进入区域前置为对应枚举值，离开置 NONE
-    sched_tag(UNSHARED, SCHED_UNSHARED_HELD);
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD);
     critical_logic();
-    sched_tag(UNSHARED, SCHED_UNSHARED_NONE);
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE);
 
     // 2. 带有变量依赖的共调度（计算指针地址的 Bloom Filter 魔数）
     int my_mutex = 0;
-    sched_tag(UNSHARED, SCHED_UNSHARED_HELD, &my_mutex);
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, &my_mutex);
     critical_logic_with_lock();
-    sched_tag(UNSHARED, SCHED_UNSHARED_NONE); // 离开时置 NONE 即自动清空魔数
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE); // 离开时置 NONE 即自动清空魔数
 
     // 3. 跨进程共调度（直接传递一个静态的 64 位整型 ID 作为魔数）
-    sched_tag(UNSHARED, SCHED_UNSHARED_HELD, 0xDEADBEEF12345678ULL);
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, 0xDEADBEEF12345678ULL);
     // ...
-    sched_tag(UNSHARED, SCHED_UNSHARED_NONE);
+    sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE);
 }
 ```
 

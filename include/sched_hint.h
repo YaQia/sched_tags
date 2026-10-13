@@ -4,8 +4,8 @@
 |* and bloom parameters) is defined ONCE in the kernel uapi header            *|
 |* <linux/sched_hint.h>, installed via `make headers_install`. This file is   *|
 |* a thin userspace wrapper that pulls in that single source of truth and     *|
-|* adds the userspace-only glue (TLS specifier, ELF section name, and a       *|
-|* prctl-number fallback) that has no place in the kernel ABI header.         *|
+|* adds the userspace-only glue (TLS specifier and a prctl-number fallback)   *|
+|* that has no place in the kernel ABI header.                                *|
 |*                                                                            *|
 |* Build note: point the compiler at the installed headers, e.g.             *|
 |*   -I <kernel>/usr/include   (after `make headers` / `make headers_install`)*|
@@ -17,42 +17,27 @@
 
 /* Single source of truth: struct + enums + magic/version + bloom params. */
 #include <linux/sched_hint.h>
+#include <linux/prctl.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifndef PR_SET_SCHED_HINT_OFFSET
-#define PR_SET_SCHED_HINT_OFFSET        83
-#endif
-
-/* ELF section that carries the TLS instance (linker/pass convention).       */
-#define SCHED_HINT_SECTION "__sched_hint"
-
-/* TLS storage-class specifier — portable across C11/C++11/GCC/Clang/MSVC.   */
-#if defined(__cplusplus) && __cplusplus >= 201103L
-#define SCHED_HINT_TLS thread_local
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-#define SCHED_HINT_TLS _Thread_local
-#elif defined(__GNUC__) || defined(__clang__)
-#define SCHED_HINT_TLS __thread
-#elif defined(_MSC_VER)
-#define SCHED_HINT_TLS __declspec(thread)
-#else
-#define SCHED_HINT_TLS /* unsupported — fallback to plain global */
+/* Registration prctl. Defined by the kernel uapi <linux/prctl.h> when the
+ * headers come from a sched_hint kernel; the fallback covers stock headers. */
+#ifndef PR_SET_SCHED_HINT
+#define PR_SET_SCHED_HINT              83
 #endif
 
 /*
- * Access note: the symbol the LLVM pass emits is "__sched_hint.data" (with a
- * period), which is not a legal C identifier. To read it directly, alias it
- * with inline asm, e.g.:
- *   extern SCHED_HINT_TLS struct sched_hint __sched_hint_data
- *       __asm__("__sched_hint.data");
- * (see test/reader_dynamic.h). In kernel space use current->sched_hint_kaddr.
+ * Slot access: prctl(PR_SET_SCHED_HINT, &word) backfills this thread's slot
+ * address (a 64-byte block of kernel-owned pages mapped into the process).
+ * There is no userspace sched_hint object to reach for — readers call
+ * sched_hint_current() (sched_tag.h), writers go through sched_tag_set().
  */
 
 #ifdef __cplusplus
-} /* extern "C" */
+}
 #endif
 
 #endif /* SCHED_HINT_WRAPPER_H */

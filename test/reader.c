@@ -19,10 +19,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/sched_hint.h"
-
-/* The pass emits this TLS global in the __sched_hint section. */
-extern __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data");
+#include "../include/sched_tag.h"
 
 /* Functions from the instrumented module. */
 extern int workload(int n, double x);
@@ -38,8 +35,7 @@ static int      observed_tag_id;
 static int      observe_count;
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
-    observed_exec_dense = h->exec_dense;
+    observed_exec_dense = sched_tag_get(EXEC_DENSE);
     observed_tag_id       = tag_id;
     observe_count++;
 }
@@ -84,10 +80,9 @@ static void check(const char *label, uint8_t expect_compute,
 }
 
 static void dump_current(const char *label) {
-    struct sched_hint *h = &__sched_hint_data;
     printf("  [%-28s] exec_dense=%s\n",
            label,
-           exec_name(h->exec_dense));
+           exec_name(sched_tag_get(EXEC_DENSE)));
 }
 
 /*=========================================================================*/
@@ -95,7 +90,7 @@ static void dump_current(const char *label) {
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
 
     printf("=== struct sched_hint ===\n");
     printf("magic:        0x%08x %s\n", h->magic,
@@ -104,12 +99,12 @@ int main(void) {
     printf("sizeof:       %zu bytes\n\n", sizeof(*h));
 
     if (h->magic != SCHED_HINT_MAGIC) {
-        printf("FATAL: bad magic — pass did not emit __sched_hint_data?\n");
+        printf("FATAL: bad magic — hint slot unavailable?\n");
         return 1;
     }
 
     /* Before any instrumented code runs, exec_dense should be 0. */
-    check("initial state", SCHED_EXEC_NONE, h->exec_dense);
+    check("initial state", SCHED_EXEC_NONE, sched_tag_get(EXEC_DENSE));
 
     /*
      * workload(20, 3.14): n > 10 → int_work path → SET INT.

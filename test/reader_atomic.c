@@ -21,10 +21,8 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include "../include/sched_hint.h"
+#include "../include/sched_tag.h"
 
-/* The pass emits this TLS global in the __sched_hint section. */
-extern __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data");
 
 /* Functions from the instrumented module. */
 extern int atomic_bb_work(int *p);
@@ -62,10 +60,6 @@ static uint64_t bloom_hash_reference(const void *ptr) {
     return bloom;
 }
 
-static int popcount64(uint64_t v) {
-    return __builtin_popcountll(v);
-}
-
 /*=========================================================================*/
 /* Observation callback — called from inside dense regions in the .ll      */
 /*=========================================================================*/
@@ -76,7 +70,7 @@ static int      observed_tag_id;
 static int      observe_count;
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
     observed_atomic_dense = h->atomic_dense;
     observed_atomic_magic = h->atomic_magic;
     observed_tag_id       = tag_id;
@@ -101,27 +95,17 @@ static void check(const char *label, uint8_t expect_atomic,
 
 static void check_magic(const char *label, uint64_t actual_magic,
                          int expect_nonzero) {
-    if (expect_nonzero) {
-        /* Inside a dense region: magic should be non-zero with >= K bits set */
-        int pc = popcount64(actual_magic);
-        int ok = (actual_magic != 0) && (pc >= K_BLOOM_BITS);
-        printf("  [%-34s] atomic_magic=0x%016lx (popcount=%d)  %s\n",
-               label, (unsigned long)actual_magic, pc,
-               ok ? "OK" : "FAIL");
-        if (!ok) failures++;
-    } else {
-        /* Initial state: magic should be 0 */
-        printf("  [%-34s] atomic_magic=0x%016lx\n",
-               label, (unsigned long)actual_magic);
-    }
+    /* Only the presence/absence of the tag magic is asserted here; its exact
+     * value is verified by check_magic_exact() against the reference hash. */
+    int ok = expect_nonzero ? (actual_magic != 0) : (actual_magic == 0);
+    printf("  [%-34s] %s\n", label, ok ? "OK" : "FAIL");
+    if (!ok) failures++;
 }
 
 static void check_magic_exact(const char *label, uint64_t actual_magic,
                                uint64_t expected_magic) {
     int ok = (actual_magic == expected_magic);
-    printf("  [%-34s] magic=0x%016lx expect=0x%016lx  %s\n",
-           label, (unsigned long)actual_magic, (unsigned long)expected_magic,
-           ok ? "OK" : "FAIL");
+    printf("  [%-34s] %s\n", label, ok ? "OK" : "FAIL");
     if (!ok) failures++;
 }
 
@@ -130,7 +114,7 @@ static void check_magic_exact(const char *label, uint64_t actual_magic,
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
     int scratch = 0;  /* shared variable for atomic operations */
 
     printf("=== Atomic-dense SchedTag test (with bloom filter) ===\n");
@@ -140,16 +124,13 @@ int main(void) {
     printf("sizeof:       %zu bytes\n\n", sizeof(*h));
 
     if (h->magic != SCHED_HINT_MAGIC) {
-        printf("FATAL: bad magic — pass did not emit __sched_hint_data?\n");
+        printf("FATAL: hint slot unavailable (registration failed)?\n");
         return 1;
     }
 
     /* Compute the expected bloom hash for &scratch — all 3 functions use
      * the same pointer, so their bloom magic should be identical. */
     uint64_t expected_magic = bloom_hash_reference(&scratch);
-    printf("bloom reference for &scratch (%p): 0x%016lx (popcount=%d)\n\n",
-           (void *)&scratch, (unsigned long)expected_magic,
-           popcount64(expected_magic));
 
     /* Before any instrumented code runs, both fields should be 0. */
     check("initial state", 0, h->atomic_dense);

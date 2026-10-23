@@ -26,10 +26,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/sched_hint.h"
-
-/* ---- TLS hint global emitted by the pass ---- */
-extern __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data");
+#include "../include/sched_tag.h"
 
 /* ---- Rust functions (extern "C", #[no_mangle]) ---- */
 extern int32_t rust_int_work(int32_t n);
@@ -50,7 +47,7 @@ static int      observed_tag_id;
 static int      observe_count;
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
     observed_exec_dense = h->exec_dense;
     observed_tag_id        = tag_id;
     observe_count++;
@@ -100,7 +97,7 @@ static void check(const char *label, uint8_t expect_compute,
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
 
     printf("=== Rust SchedTag test ===\n");
     printf("magic:        0x%08x %s\n", h->magic,
@@ -109,7 +106,7 @@ int main(void) {
     printf("sizeof:       %zu bytes\n\n", sizeof(*h));
 
     if (h->magic != SCHED_HINT_MAGIC) {
-        printf("FATAL: bad magic — pass did not emit __sched_hint_data?\n");
+        printf("FATAL: hint slot unavailable (registration failed)?\n");
         return 1;
     }
 

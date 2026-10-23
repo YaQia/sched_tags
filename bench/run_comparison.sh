@@ -22,6 +22,13 @@ if [ ! -f "$PROJECT_ROOT/build/pass/libSchedTagPass.so" ]; then
 	exit 1
 fi
 
+# Runtime library (provides __sched_hint_ptr / __sched_hint_register)
+if [ ! -f "$PROJECT_ROOT/build/libsched_tag.a" ]; then
+	echo "Error: sched_tag library not found at build/libsched_tag.a"
+	echo "Please run: cmake --build build"
+	exit 1
+fi
+
 # Configuration
 NUM_THREADS=${1:-4}
 DURATION_MS=${2:-2000}
@@ -42,16 +49,17 @@ echo ""
 echo "[2/3] Building instrumented version (with atomic_dense hints)..."
 clang -O2 -fpass-plugin="$PROJECT_ROOT/build/pass/libSchedTagPass.so" \
 	"$SCRIPT_DIR/atomic_contention.c" -pthread \
+	"$PROJECT_ROOT/build/libsched_tag.a" \
 	-o /tmp/atomic_tagged
 echo "  → /tmp/atomic_tagged"
 echo ""
 
-# Verify instrumentation
+# Verify instrumentation (sched_hint library symbols referenced by the pass)
 echo "[2.5/3] Verifying instrumentation..."
-if readelf -s /tmp/atomic_tagged | grep -q "__sched_hint\.data"; then
-	echo "  ✓ __sched_hint.data TLS symbol found"
+if readelf -s /tmp/atomic_tagged | grep -q "__sched_hint_register"; then
+	echo "  ✓ sched_hint library symbols found (__sched_hint_register/_ptr)"
 else
-	echo "  ✗ Warning: __sched_hint.data not found (pass may not have instrumented)"
+	echo "  ✗ Warning: sched_hint library symbols not found (pass may not have instrumented)"
 fi
 echo ""
 

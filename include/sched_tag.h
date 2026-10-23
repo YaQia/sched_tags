@@ -1,8 +1,9 @@
 /*===-- sched_tag.h - Source-level Scheduling Instrumentation --------------===*\
 |*                                                                            *|
-|* This header provides the `sched_tag_set` function/macro for directly       *|
-|* instrumenting source code with scheduling tags. It is a lightweight        *|
-|* alternative or complement to the LLVM-based `sched_tags.json` config.      *|
+|* This header provides the `sched_tag_set` writer plus the `sched_tag_get`   *|
+|* and `sched_tag_test_magic` readers, for directly instrumenting source      *|
+|* code with scheduling tags. It is a lightweight alternative or complement   *|
+|* to the LLVM-based `sched_tags.json` config.                                *|
 |*                                                                            *|
 |* Data model: each thread's tags live in a 64-byte slot inside kernel-owned  *|
 |* pages. The first use on a thread registers it via                          *|
@@ -25,7 +26,18 @@
 |*      ...                                                                   *|
 |*      sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE);                         *|
 |*                                                                            *|
+|*   4. Read back / probe (the raw struct is never exposed):                  *|
+|*      uint8_t v      = sched_tag_get(UNSHARED);                             *|
+|*      bool    shared = sched_tag_test_magic(UNSHARED, &my_mutex);           *|
+|*                                                                            *|
 \*===----------------------------------------------------------------------===*/
+
+/*
+ * Link users of this header with the library `libsched_tag.a`: it owns the
+ * single per-thread registration and slot cache, and this header is the inline
+ * API over it. A program that never uses tags never references it, so the
+ * linker does not pull it in.
+ */
 
 #ifndef SCHED_TAG_H
 #define SCHED_TAG_H
@@ -33,63 +45,52 @@
 #include "sched_hint.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <sys/prctl.h>
-#include <pthread.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * Per-thread slot cache. Weak so that GCC/Clang can include this header
- * from many translation units and the linker merges the TLS instances.
+ * Per-thread slot cache, defined once in the library (libsched_tag).
+ * Shared by every translation unit and by the LLVM pass, so all writers and
+ * readers hit the same cell for the current thread.
  *
  * NULL                   — not yet registered (first use registers)
  * __SCHED_HINT_DISABLED  — registration failed; give up for this thread
  * otherwise              — this thread's live slot
  */
-__attribute__((weak, tls_model("initial-exec")))
-__thread struct sched_hint *__sched_hint_ptr;
+extern __thread struct sched_hint *__sched_hint_ptr
+    __attribute__((tls_model("initial-exec")));
 
 /* Cache value for "registration failed, stop trying". Real slots are
  * 64-byte aligned userspace addresses, so 1 can never be one. */
 #define __SCHED_HINT_DISABLED ((struct sched_hint *)1)
 
 /*
- * Register this thread and return its slot, or NULL on failure.
- * Idempotent kernel-side, but we call it at most once per thread: on
- * failure the cache settles on the disabled sentinel — permanent for
- * this thread, since retrying would only win back a rare ENOMEM and
- * would cost a failed prctl per tag write on kernels without support.
+ * Register the calling thread and return its slot, or NULL on failure.
+ * Defined once in the library (libsched_tag). Idempotent kernel-side,
+ * but we call it at most once per thread: on failure the cache settles on the
+ * disabled sentinel — permanent for this thread, since retrying would only win
+ * back a rare ENOMEM and would cost a failed prctl per tag write on kernels
+ * without support.
  *
- * The magic/version read doubles as the pre-touch: it faults the slot's
- * page in once, here in the cold path, instead of inside the first tagged
- * region — and it doubles as an ABI check: a mismatched header means the
- * kernel's struct layout may differ from this build's, so refuse to write.
+ * The magic/version read doubles as the pre-touch: it faults the slot's page
+ * in once, here in the cold path, instead of inside the first tagged region —
+ * and it doubles as an ABI check: a mismatched header means the kernel's
+ * struct layout may differ from this build's, so refuse to write.
  */
-static __attribute__((unused, noinline, cold))
-struct sched_hint *__sched_hint_register(void)
-{
-    unsigned long slot = 0;
-    struct sched_hint *h;
-
-    if (prctl(PR_SET_SCHED_HINT, (unsigned long)&slot, 0, 0, 0) != 0)
-        goto fail;
-    h = (struct sched_hint *)slot;
-    if (h->magic != SCHED_HINT_MAGIC || h->version != SCHED_HINT_VERSION)
-        goto fail;
-    __sched_hint_ptr = h;
-    return h;
-fail:
-    __sched_hint_ptr = __SCHED_HINT_DISABLED;
-    return NULL;
-}
+extern struct sched_hint *__sched_hint_register(void);
 
 /*
- * Internal: this thread's slot for tag WRITES (the sched_tag_set()
- * implementation path). Same lazy-registration and NULL semantics as
- * the public reader below. A cache value <= 1 is never a slot (they
- * are 64-byte aligned): NULL = first use, __SCHED_HINT_DISABLED = gave up.
+ * Internal: this thread's slot, shared by the tag readers and writers
+ * (sched_tag_set / sched_tag_get / sched_tag_test_magic). Deliberately
+ * NOT exposed: handing out the raw slot would let callers touch the
+ * kernel-stamped header or any field, so the only public surface is the
+ * typed tag API below. Lazy-registers on first use. A cache value <= 1
+ * is never a slot (slots are 64-byte aligned): NULL = first use,
+ * __SCHED_HINT_DISABLED = gave up. Returns NULL when the mechanism is
+ * unavailable (kernel without sched_hint support, or ABI mismatch).
  */
 static inline struct sched_hint *__sched_hint_slot(void)
 {
@@ -97,40 +98,6 @@ static inline struct sched_hint *__sched_hint_slot(void)
     if ((uintptr_t)h <= 1)
         return h ? NULL : __sched_hint_register();
     return h;
-}
-
-/*
- * The current thread's live slot, READ-ONLY view for readers and
- * diagnostics. Lazily registers on first use, returns NULL when the
- * mechanism is unavailable (kernel without sched_hint support, or ABI
- * mismatch). The const return puts the contract in the type system:
- * the header (magic/version) is kernel-stamped, and all payload writes
- * go through sched_tag_set() — writing through this pointer must not
- * compile.
- */
-static inline const struct sched_hint *sched_hint_current(void)
-{
-    return __sched_hint_slot();
-}
-
-/*
- * fork() copies this thread's TLS, so the child would inherit a pointer to
- * the parent's slot — but the slot mapping is VM_DONTCOPY, so the address
- * is unmapped in the child and the first tag write would fault. Clear the
- * cache in the child; it re-registers on first use and gets a slot in its
- * own area. (Raw clone(CLONE_VM) without pthread_atfork coverage shares the
- * parent's TLS wholesale — writes then land in the parent's slot, which is
- * semantically wrong but harmless.)
- */
-static void __sched_hint_atfork_child(void)
-{
-    __sched_hint_ptr = NULL;
-}
-
-__attribute__((constructor, weak))
-void __sched_hint_atfork_init(void)
-{
-    pthread_atfork(NULL, NULL, __sched_hint_atfork_child);
 }
 
 /* Tag types corresponding to sched_hint fields */
@@ -142,19 +109,32 @@ typedef enum {
     LOAD_TREND
 } sched_tag_type_t;
 
-/* Bloom filter hash calculation (identical to LLVM pass logic).
- * Takes __u64* to match the struct sched_hint magic fields exactly (the uapi
- * header uses __u64 == unsigned long long, which is a distinct pointer type
- * from uint64_t on LP64 even though the width matches). */
-static inline void __sched_tag_bloom_add(__u64 *bloom, const void *ptr) {
-    if (!ptr) return;
+/* Bloom filter hash calculation (identical to the kernel's / LLVM pass logic).
+ * One 64-byte-aligned pointer sets up to SCHED_HINT_BLOOM_K bit positions in a
+ * 64-bit word. The K positions come from 16-bit-strided fields of the hash and
+ * are combined with a straight-line OR (no branch/loop), so the scheduler can
+ * issue them in parallel and out-of-order. Positions may collide, so fewer than
+ * K bits can be set; that is fine because the scheduler keys on the whole magic
+ * word (equal magic == same resource) rather than counting set bits. A null
+ * pointer maps to 0, which is the intended "no address / no info" value.
+ *
+ * Returns __u64 to match the struct sched_hint magic fields exactly (the uapi
+ * header uses __u64 == unsigned long long, a distinct pointer type from
+ * uint64_t on LP64 even though the width matches). */
+static inline __u64 __sched_tag_bloom_of(const void *ptr) {
+    if (!ptr) return 0;
     uint64_t addr = (uint64_t)(uintptr_t)ptr;
     addr &= ~63ULL; /* align to 64 bytes */
     uint64_t h = addr * SCHED_HINT_BLOOM_PRIME; /* single-source hash constant */
-    *bloom |= (1ULL << (h & 63))
-           |  (1ULL << ((h >> 16) & 63))
-           |  (1ULL << ((h >> 32) & 63))
-           |  (1ULL << ((h >> 48) & 63));
+    return (1ULL << (h & 63))
+         |  (1ULL << ((h >> 16) & 63))
+         |  (1ULL << ((h >> 32) & 63))
+         |  (1ULL << ((h >> 48) & 63));
+}
+
+/* OR `ptr`'s bloom bits into `*bloom` (idempotent). */
+static inline void __sched_tag_bloom_add(__u64 *bloom, const void *ptr) {
+    *bloom |= __sched_tag_bloom_of(ptr);
 }
 
 /* Base setter (no magic var). Returns the slot (NULL when unavailable)
@@ -189,6 +169,61 @@ static inline void __sched_tag_set_id(sched_tag_type_t type, uint8_t value, uint
         if (type == ATOMIC_DENSE) hint->atomic_magic = id;
         else if (type == UNSHARED) hint->unshared_magic = id;
     }
+}
+
+/*
+ * Reader: the value currently stored in this thread's tag payload field, or
+ * 0 when the mechanism is unavailable (kernel without sched_hint support, or
+ * ABI mismatch). 0 means "no tag active", so an unsupported kernel reads as
+ * "nothing set" rather than an error. This is the inverse of
+ * sched_tag_set(type, value).
+ *
+ * Note it returns only the state byte, never the magic word: the raw magic is
+ * an opaque address hash (or a static id) that callers should not reason
+ * about. To probe it, use sched_tag_test_magic() below.
+ */
+static inline uint8_t sched_tag_get(sched_tag_type_t type) {
+    struct sched_hint *hint = __sched_hint_slot();
+    if (!hint)
+        return 0;
+    switch (type) {
+        case EXEC_DENSE:    return hint->exec_dense;
+        case MEMORY_DENSE:  return hint->memory_dense;
+        case ATOMIC_DENSE:  return hint->atomic_dense;
+        case UNSHARED:      return hint->unshared;
+        case LOAD_TREND:    return hint->load_trend;
+    }
+    return 0;
+}
+
+/*
+ * Predicate: does this thread's stored magic for `type` include the bloom bits
+ * of `ptr`? This is how a caller probes co-scheduling without ever seeing the
+ * opaque magic word.
+ *
+ * Only meaningful when the tag was set with a pointer magic (bloom mode):
+ *     sched_tag_set(type, value, &lock);
+ *     sched_tag_test_magic(type, &lock) -> true
+ * A static-id set (sched_tag_set(type, value, 0xDEAD...)) stores the id
+ * verbatim, not a bloom, so this test does not apply to it.
+ *
+ * Membership is "every bloom bit of ptr is present in the stored word"
+ * (subset), i.e. the exact inverse of __sched_tag_bloom_add() for a single
+ * pointer. Because the K raw positions can collide, a pointer may set fewer
+ * than K bits, so the subset form is used rather than a popcount>=K test.
+ */
+static inline bool sched_tag_test_magic(sched_tag_type_t type, const void *ptr) {
+    struct sched_hint *hint = __sched_hint_slot();
+    __u64 stored, want;
+    if (!hint || !ptr)
+        return false;
+    switch (type) {
+        case ATOMIC_DENSE: stored = hint->atomic_magic; break;
+        case UNSHARED:     stored = hint->unshared_magic; break;
+        default:           return false;
+    }
+    want = __sched_tag_bloom_of(ptr);
+    return want != 0 && (stored & want) == want;
 }
 
 #ifdef __cplusplus

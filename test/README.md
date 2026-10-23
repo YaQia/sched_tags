@@ -2,36 +2,36 @@
 
 本目录包含用于验证 `SchedTagPass` LLVM pass 插桩正确性的端到端测试。
 
-## TLS 变量访问说明
+## 存储机制说明
 
-**重要变更**：从现在开始，编译器插桩生成的TLS变量符号名为 `__sched_hint.data`（包含句点），
-这在C/C++源码中是非法标识符，**无法通过常规的 `extern __thread` 声明直接访问**。
+内核**自己持有** `struct sched_hint` slot，并以 `VM_SHARED` 映射进进程（禁止 `mremap`/unmap）。
+用户态每个线程只需调一次 `prctl(PR_SET_SCHED_HINT, &slot)`，内核回填 slot 的用户地址。
 
-### 为什么使用特殊字符？
+pass 只在插桩代码里**引用**两个符号；它们的**唯一定义**在 `libsched_tag.a`（测试链接时带上）：
 
-1. **防止用户干扰**：用户代码无法定义同名变量来干扰编译器插桩
-2. **保持链接一致性**：固定名称确保多个 `.o` 文件链接时符号一致
-3. **源码层面隔离**：句点 `.` 在 C/C++ 标识符中非法
+| 符号 | 作用 | 定义处 |
+|---|---|---|
+| `__sched_hint_ptr` | 每线程缓存：`0`=未注册，`1`=已放弃，其余=slot 地址 | `sched_tag.c` |
+| `__sched_hint_register` | 冷路径：`prctl` 注册 + 校验 magic/version + 缓存 | `sched_tag.c` |
+| `__sched_hint_atfork_child` / `_init` | fork 后清缓存，令子进程重新注册 | `sched_tag.c` |
 
-### 如何访问？
+插桩点内联"快路径"（读缓存 / 判断 / 写 slot），**不产生 call**；只有冷注册是 `call`。把它们放进库是为了**一份实现、一次注册**——构造函数若每个 TU 都发射，会被调用 N 次。
 
-使用 `test/reader_dynamic.h` 提供的辅助函数：
+### 如何在 reader 中读取？
 
-```c
-#include "reader_dynamic.h"
+- 语义化读取：`#include "../include/sched_tag.h"`，用 `sched_tag_get(TAG)` /
+  `sched_tag_test_magic(TAG, ptr)`。pass 和手写 `sched_tag_set` 写的是**同一个 slot**，
+  所以两种插桩方式可被同一个 `sched_tag_get` 读到。
+- 原始字段（测试用）：`__sched_hint_slot()` 返回当前线程 slot 的 `struct sched_hint *`。
 
-struct sched_hint *hint = get_sched_hint_data();
-// 现在可以使用 hint->exec_dense 等字段
-```
-
-该头文件使用内联汇编（通过 `__asm__` 重命名）访问符号。
+读取通过库返回的 slot 指针完成，无需符号查找或内联汇编。
 
 ## 测试原理
 
 核心思路是**在密集区域执行期间**观测 hint 状态。
 
 `.ll` 文件中的密集 BB / 循环体内嵌入了 `call void @observe_hint(i32 %id)`，
-该函数在 `reader*.c` 中实现，会在被调用时快照 TLS 变量的当前状态。
+该函数在 `reader*.c` 中实现，会在被调用时快照当前线程内核 slot 的状态。
 这样 reader 的 `main` 函数就能验证：
 
 1. **SET 验证** — 回调捕获的快照中 payload 字段（及 `atomic_magic` bloom filter）是否正确
@@ -56,8 +56,8 @@ test/
 ├── reader_source_labels.c  # C 运行时验证器: 配合 test_source_labels.ll
 ├── reader_rust.c           # C 运行时验证器: 配合 Rust 生成的 IR
 ├── reader_prctl.c          # prctl 构造函数测试
-├── reader_obfuscated.c     # 使用动态符号查找的测试（推荐）
-└── reader_dynamic.h        # TLS 变量访问辅助函数
+├── reader_obfuscated.c     # 使用辅助函数访问当前线程 slot 的测试
+└── reader_dynamic.h        # 当前线程 slot 访问辅助函数
 ```
 
 ### `.ll` 文件 — 测试输入
@@ -105,7 +105,7 @@ call 后密度比仍然超过阈值。
 
 每个 reader 文件包含：
 
-- **`observe_hint(int tag_id)`** — 回调函数，读取 TLS 变量 `__sched_hint_data`
+- **`observe_hint(int tag_id)`** — 回调函数，读取当前线程 slot 的 payload 字段
   的 payload 字段（含 `atomic_magic` bloom filter），保存为快照
 - **`check()`** — 断言辅助，比较期望值与实际值，统计失败数
 - **`main()`** — 依次调用被插桩函数，检查回调快照（SET 验证），
@@ -116,6 +116,7 @@ call 后密度比仍然超过阈值。
 ## 前置条件
 
 - 已构建 pass 插件: `build/pass/libSchedTagPass.so`（项目根目录执行 `cmake --build build`）
+- 已构建库: `build/libsched_tag.a`（同上，随 `cmake --build build` 一起产出）
 - 系统安装了 `opt`、`llc`、`clang`（版本需与构建 pass 时使用的 LLVM 一致，当前为 **LLVM 22**）
 
 ## 运行方法
@@ -131,7 +132,7 @@ opt -load-pass-plugin=build/pass/libSchedTagPass.so \
 llc /tmp/tagged.bc -filetype=obj -o /tmp/tagged.o
 
 # 3. 链接
-clang /tmp/tagged.o test/reader.c -lm -o /tmp/test_reader
+clang /tmp/tagged.o test/reader.c build/libsched_tag.a -lm -o /tmp/test_reader
 
 # 4. 运行（退出码 0 = 通过）
 /tmp/test_reader
@@ -145,7 +146,7 @@ opt -load-pass-plugin=build/pass/libSchedTagPass.so \
 
 llc /tmp/tagged_loops.bc -filetype=obj -o /tmp/tagged_loops.o
 
-clang /tmp/tagged_loops.o test/reader_loops.c -lm -o /tmp/test_loops
+clang /tmp/tagged_loops.o test/reader_loops.c build/libsched_tag.a -lm -o /tmp/test_loops
 
 /tmp/test_loops
 ```
@@ -158,7 +159,7 @@ opt -load-pass-plugin=build/pass/libSchedTagPass.so \
 
 llc /tmp/tagged_atomic.bc -filetype=obj -o /tmp/tagged_atomic.o
 
-clang /tmp/tagged_atomic.o test/reader_atomic.c -lm -o /tmp/test_atomic
+clang /tmp/tagged_atomic.o test/reader_atomic.c build/libsched_tag.a -lm -o /tmp/test_atomic
 
 /tmp/test_atomic
 ```
@@ -180,7 +181,7 @@ opt -load-pass-plugin=build/pass/libSchedTagPass.so \
 llc /tmp/tagged_rust.bc -filetype=obj -o /tmp/tagged_rust.o
 
 # 4. 链接
-clang /tmp/tagged_rust.o test/reader_rust.c -lm -o /tmp/test_rust
+clang /tmp/tagged_rust.o test/reader_rust.c build/libsched_tag.a -lm -o /tmp/test_rust
 
 # 5. 运行
 /tmp/test_rust
@@ -205,7 +206,7 @@ opt -load-pass-plugin=build/pass/libSchedTagPass.so \
 llc /tmp/tagged_source.bc -filetype=obj -o /tmp/tagged_source.o
 
 # 3. 链接
-clang /tmp/tagged_source.o test/reader_source_labels.c -o /tmp/test_source
+clang /tmp/tagged_source.o test/reader_source_labels.c build/libsched_tag.a -o /tmp/test_source
 
 # 4. 运行（退出码 0 = 通过）
 /tmp/test_source
@@ -229,10 +230,11 @@ clang /tmp/tagged_source.o test/reader_source_labels.c -o /tmp/test_source
   ┌──────────┐
   │   llc    │  bitcode → 目标文件
   └────┬─────┘
-       │ .o (含 __sched_hint TLS 段)
+       │ .o (引用 sched_hint 库符号)
        ▼
   ┌──────────┐
-  │  clang   │  链接 reader*.c (提供 observe_hint 实现) + 插桩后的 .o
+  │  clang   │  链接 reader*.c (提供 observe_hint 实现) + 插桩后的 .o +
+  │          │  libsched_tag.a (提供库符号)
   └────┬─────┘
        │ 可执行文件
        ▼
@@ -288,28 +290,26 @@ magic:        0x48494e54 (OK)
 version:      1
 sizeof:       64 bytes
 
-bloom reference for &scratch (0x...): 0x... (popcount=4)
-
   [initial state                     ] atomic_dense=0  OK
-  [initial state (magic)             ] atomic_magic=0x0000000000000000
+  [initial state (magic)             ] OK
 
 --- atomic_bb_work [BB-level atomic dense] ---
   result = ..., observe_count = 1
   [inside atomic_bb (cb)             ] atomic_dense=1  OK
-  [inside atomic_bb magic (cb)       ] atomic_magic=0x... (popcount=4)  OK
-  [atomic_bb magic vs ref            ] magic=0x... expect=0x...  OK
+  [inside atomic_bb magic (cb)       ] OK
+  [atomic_bb magic vs ref            ] OK
 
 --- atomic_loop_work(10) [loop-level atomic dense] ---
   result = ..., observe_count = 10
   [inside atomic loop (cb)           ] atomic_dense=1  OK
-  [inside atomic loop magic (cb)     ] atomic_magic=0x... (popcount=4)  OK
-  [atomic_loop magic vs ref          ] magic=0x... expect=0x...  OK
+  [inside atomic loop magic (cb)     ] OK
+  [atomic_loop magic vs ref          ] OK
 
 --- mixed_atomic_bb(200) [atomic BB path] ---
   result = ..., observe_count = 1
   [inside atomic_bb (cb)             ] atomic_dense=1  OK
-  [inside mixed_bb magic (cb)        ] atomic_magic=0x... (popcount=4)  OK
-  [mixed_bb magic vs ref             ] magic=0x... expect=0x...  OK
+  [inside mixed_bb magic (cb)        ] OK
+  [mixed_bb magic vs ref             ] OK
 
 --- mixed_atomic_bb(50) [skip atomic BB] ---
   result = ..., observe_count = 0 (expect 0)
@@ -320,12 +320,11 @@ bloom reference for &scratch (0x...): 0x... (popcount=4)
 === ALL PASSED (0 failure(s)) ===
 ```
 
-> **Note:** The exact `atomic_magic` hex value depends on the runtime address of
-> `&scratch` (stack ASLR). The test verifies: (1) non-zero inside dense regions,
-> (2) `popcount >= 4` (k=4 bloom bits), (3) matches the C reference
-> `bloom_hash_reference(&scratch)`. **atomic_dense** clearing is now handled by
-> the kernel scheduler on context switch. `atomic_magic` is never cleared
-> (performance optimization); its value is stale when `atomic_dense=0`.
+> **Note:** The test verifies the tag magic only by (1) presence/absence and
+> (2) exact equality to the C reference `bloom_hash_reference(&scratch)`; the raw
+> value is not printed (`&scratch`'s address varies with stack ASLR). **atomic_dense**
+> clearing is handled by the kernel scheduler on context switch; `atomic_magic` is
+> never cleared (performance optimization), so it is stale when `atomic_dense=0`.
 
 ## 调试技巧
 

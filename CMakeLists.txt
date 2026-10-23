@@ -25,6 +25,24 @@ if(NOT LLVM_ENABLE_RTTI)
 endif()
 
 #===----------------------------------------------------------------------===#
+# Runtime library: libsched_tag.a
+#===----------------------------------------------------------------------===#
+# Single instance of the per-thread sched_hint support: the TLS slot cache, the
+# prctl() registrar, and the fork hook. Instrumented code (manual header use or
+# the LLVM pass) only references __sched_hint_ptr / __sched_hint_register; this
+# library defines them, so there is exactly one .init_array entry.
+set(KERNEL_HEADERS "" CACHE PATH
+    "Optional extra include dir holding linux/sched_hint.h (uninstalled kernel tree)")
+
+add_library(sched_tag STATIC
+  sched_tag.c
+)
+target_include_directories(sched_tag PUBLIC
+  ${CMAKE_SOURCE_DIR}/include
+  ${KERNEL_HEADERS}
+)
+
+#===----------------------------------------------------------------------===#
 # Pass plugin target
 #===----------------------------------------------------------------------===#
 add_subdirectory(pass)

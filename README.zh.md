@@ -6,8 +6,8 @@
 
 | 词 | 层 | 含义 | 例 |
 |---|---|---|---|
-| **hint** | 内核机制 / ABI | 载体。内核只搬运不透明的 64 字节提示块，不知道"标签"为何物 | `struct sched_hint`、`PR_SET_SCHED_HINT`、`sched_hint_current()` |
-| **tag** | 运行时标注 | 行为。开发者或 Pass 往载体里写的内容 | `sched_tag_set()`、`SchedTagPass`、`sched_tags.json` |
+| **hint** | 内核机制 / ABI | 载体。内核只搬运不透明的 64 字节提示块，不知道"标签"为何物 | `struct sched_hint`、`PR_SET_SCHED_HINT`、`linux/sched_hint.h` |
+| **tag** | 运行时标注 | 行为。开发者或 Pass 往载体里写的内容 | `sched_tag_set()` / `sched_tag_get()` / `sched_tag_test_magic()`、`SchedTagPass`、`sched_tags.json` |
 | **label** | 静态配置 | 声明。`sched_tags.json` 里一条"在哪打什么 tag"的描述 | `SourceLabelAnalysis`、JSON label schema |
 
 规则：**越靠近内核越用 hint，越靠近开发者越用 tag，配置文件里的条目叫 label**。新增命名时先问自己在哪一层。
@@ -26,15 +26,19 @@ cmake -B build -DKERNEL_HEADERS=/path/to/kernel/usr/include
 cmake --build build -j$(nproc)
 ```
 
-> 手动用 `clang` 编译被插桩代码或 header-only 使用时，对应地加 `-I /path/to/kernel/usr/include`。
+> 手动用 `clang` 编译被插桩代码时，对应地加 `-I /path/to/kernel/usr/include`。
 
 ## 使用方法
 
 你可以通过 LLVM Pass 在编译期自动插桩，也可以直接在源码中引入头文件进行手动插桩。这两种方式可以混合使用，也可单独使用。
 
-### 方式一：源码级手动插桩 (Header-only)
+### 方式一：源码级手动插桩（头文件 + 库）
 
-我们提供了一个轻量级的 C/C++ 头文件 `include/sched_tag.h`，它完全独立于 LLVM Pass。你只需要在代码中包含它，即可直接对代码块打上调度标签。它兼容原生的 GCC 和 Clang 编译器。
+引入头文件 `include/sched_tag.h` 即可在代码里直接打标签，与 LLVM Pass 相互独立，兼容 GCC 和 Clang。每线程的注册、slot 缓存以及 fork 钩子由库 `libsched_tag.a` 提供（一份实现、一次注册），所以使用时需要链接它：
+
+```bash
+clang -I include -I /path/to/kernel/usr/include your.c build/libsched_tag.a -o your
+```
 
 ```c
 #include "sched_tag.h"
@@ -58,7 +62,16 @@ void process_data() {
 }
 ```
 
-> header-only 方式同样依赖 `linux/sched_hint.h`（`sched_tag.h` 会包含它）。头文件不在默认 sysroot 时，编译加 `-I /path/to/kernel/usr/include`。
+> 该方式依赖内核头 `linux/sched_hint.h`（`sched_tag.h` 会包含它）。头文件不在默认 sysroot 时，编译加 `-I /path/to/kernel/usr/include`。
+
+读取标签用 `sched_tag_get()`，探测共调度关系用 `sched_tag_test_magic()`。两者都只从 tag 层暴露信息，不会交出裸的 `struct sched_hint`，因此用户无法误改内核盖章的头部或其他字段：
+
+```c
+uint8_t v      = sched_tag_get(UNSHARED);                   // 当前 tag 值；未激活或不支持时为 0
+bool    shared = sched_tag_test_magic(UNSHARED, &my_mutex); // 存储的 magic 是否命中该指针
+```
+
+> `sched_tag_test_magic()` 只对"指针魔数"(bloom) 形式的标签有意义；用静态魔数（`value` 传整数）设置的标签存的是原样的 id，不适配该探测。
 
 ### 方式二：基于 LLVM Pass 的自动化插桩
 
@@ -66,15 +79,23 @@ void process_data() {
 
 ```bash
 # 基本使用（以 C 语言为例）
-clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -c input.c -o output.o
+clang -O3 -fpass-plugin=build/pass/libSchedTagPass.so -c input.c -o output.o
 
 # 禁用 Pass 自动分析插桩
 # 如果只需要通过 sched_tags.json 显式配置标签，而不需要 Pass 自动去分析代码特征（如自动识别计算密集或原子操作等），
 # 可以传入 -mllvm -sched-auto-analysis=false 参数来禁用自动分析。
-clang -O3 -fpass-plugin=build/pass/SchedTagPass.so -mllvm -sched-auto-analysis=false -c input.c -o output.o
+clang -O3 -fpass-plugin=build/pass/libSchedTagPass.so -mllvm -sched-auto-analysis=false -c input.c -o output.o
 ```
 
 > **注意**：不同操作系统下插件扩展名不同，Linux 下为 `.so`，macOS 下通常为 `.dylib`。
+
+Pass 只在插桩代码里引用库符号（`__sched_hint_ptr` / `__sched_hint_register`），这些符号由 `libsched_tag.a` 提供，所以**最终链接**时要把它带上：
+
+```bash
+clang output.o more.o build/libsched_tag.a -o app
+```
+
+> 该库是静态库：程序若完全没用标签，链接器不会拉入它，也就没有任何额外开销（无构造函数、无 `.init_array` 条目）。
 
 ## 包含标签
 

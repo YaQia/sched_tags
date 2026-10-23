@@ -12,12 +12,9 @@ add_library(SchedTagPass MODULE
   SchedTagPass.cpp
 )
 
-# linux/sched_hint.h normally lives in the default sysroot (/usr/include/linux,
-# once the kernel headers are installed — or in mainline). Leave KERNEL_HEADERS
-# empty in that case. Only set it (e.g. -DKERNEL_HEADERS=<kernel>/usr/include)
-# when building against an as-yet-uninstalled custom kernel tree.
-set(KERNEL_HEADERS "" CACHE PATH
-    "Optional extra include dir holding linux/sched_hint.h (uninstalled kernel tree)")
+# KERNEL_HEADERS is defined in the top-level CMakeLists (it is shared with the
+# libsched_tag library). linux/sched_hint.h normally lives in the
+# default sysroot once the kernel headers are installed (or in mainline).
 
 target_include_directories(SchedTagPass PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}

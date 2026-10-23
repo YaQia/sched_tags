@@ -1,21 +1,16 @@
 /*
- * test/reader_obfuscated.c — Runtime verification with obfuscated symbol names.
+ * test/reader_obfuscated.c — Runtime verification via the slot accessor.
  *
- * This test uses dynamic symbol lookup to find the sched_hint TLS variable
- * even when it has an obfuscated name with special characters.
+ * Verifies the same instrumentation as reader.c, but reads the current
+ * thread's slot through the reader_dynamic.h helper instead of sched_tag_get(),
+ * exercising an alternate access path.
  *
  * Build & run:
- *   # With custom symbol name (for testing):
- *   opt -load-pass-plugin=build/pass/libSchedTagPass.so \
- *       -passes=sched-tag -sched-hint-symbol="__sched_hint.test$123" \
- *       test/test_dense.ll -o /tmp/tagged.bc
- *
- *   # With random obfuscated name (production):
  *   opt -load-pass-plugin=build/pass/libSchedTagPass.so \
  *       -passes=sched-tag test/test_dense.ll -o /tmp/tagged.bc
- *
  *   llc /tmp/tagged.bc -filetype=obj -o /tmp/tagged.o
- *   clang /tmp/tagged.o test/reader_obfuscated.c -o /tmp/test_obfuscated
+ *   clang /tmp/tagged.o test/reader_obfuscated.c build/libsched_tag.a \
+ *       -o /tmp/test_obfuscated
  *   /tmp/test_obfuscated
  */
 
@@ -93,7 +88,7 @@ static void check(const char *label, uint8_t expect_compute,
 /*=========================================================================*/
 
 int main(void) {
-    printf("=== Testing with obfuscated TLS symbol ===\n\n");
+    printf("=== Testing via the slot accessor ===\n\n");
     
     /* Find the TLS variable dynamically */
     g_hint = find_sched_hint_var();

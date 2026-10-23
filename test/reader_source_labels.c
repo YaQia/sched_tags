@@ -21,10 +21,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/sched_hint.h"
+#include "../include/sched_tag.h"
 
-/* The pass emits this TLS global in the __sched_hint section. */
-extern __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data");
 
 /* Functions from the instrumented module. */
 extern int labeled_compute(int n);
@@ -64,7 +62,7 @@ static struct hint_snapshot snapshots[100];
 static int snapshot_count = 0;
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
     if (tag_id < 100) {
         snapshots[tag_id].exec_dense = h->exec_dense;
         snapshots[tag_id].memory_dense = h->memory_dense;
@@ -149,7 +147,7 @@ static void check_trend(const char *label, uint8_t expect, uint8_t actual) {
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *hint = &__sched_hint_data;
+    struct sched_hint *hint = __sched_hint_slot();
     
     printf("=== Source Labels Test (sched_tags.json) ===\n");
     printf("magic:        0x%08x %s\n", hint->magic,

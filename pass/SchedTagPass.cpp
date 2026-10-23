@@ -132,7 +132,7 @@ struct InstrStats {
 };
 
 static InstrStats
-instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
+instrumentRegions(Function &F, DensityResult &Plan,
                   const char *TagName, unsigned FieldIdx,
                   bool EmitBloomMagic = false,
                   std::function<std::string(uint8_t)> NameFn = nullptr) {
@@ -149,12 +149,12 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     // SET before the branch into the loop header.
     {
       IRBuilder<> Builder(LR.Preheader->getTerminator());
-      emitFieldStore(Builder, HintGV, FieldIdx, LR.Value);
+      emitFieldStore(Builder, FieldIdx, LR.Value);
       if (EmitBloomMagic) {
         if (LR.StaticMagic.has_value()) {
-          emitFieldStore(Builder, HintGV, MagicFieldIdx, *LR.StaticMagic);
+          emitFieldStore(Builder, MagicFieldIdx, *LR.StaticMagic);
         } else {
-          emitBloomMagicStore(Builder, HintGV, LR.BasePointers, MagicFieldIdx);
+          emitBloomMagicStore(Builder, LR.BasePointers, MagicFieldIdx);
         }
       }
     }
@@ -172,12 +172,12 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     // SET at BB entry (after PHI nodes).
     {
       IRBuilder<> Builder(&*BR.BB->getFirstNonPHIOrDbg());
-      emitFieldStore(Builder, HintGV, FieldIdx, BR.Value);
+      emitFieldStore(Builder, FieldIdx, BR.Value);
       if (EmitBloomMagic) {
         if (BR.StaticMagic.has_value()) {
-          emitFieldStore(Builder, HintGV, MagicFieldIdx, *BR.StaticMagic);
+          emitFieldStore(Builder, MagicFieldIdx, *BR.StaticMagic);
         } else {
-          emitBloomMagicStore(Builder, HintGV, BR.BasePointers, MagicFieldIdx);
+          emitBloomMagicStore(Builder, BR.BasePointers, MagicFieldIdx);
         }
       }
     }
@@ -198,12 +198,12 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
     if (RM.IsStart) {
       // SET before Inst
       IRBuilder<> Builder(RM.Inst);
-      emitFieldStore(Builder, HintGV, FieldIdx, RM.Value);
+      emitFieldStore(Builder, FieldIdx, RM.Value);
       if (EmitBloomMagic) {
         if (RM.StaticMagic.has_value()) {
-          emitFieldStore(Builder, HintGV, MagicFieldIdx, *RM.StaticMagic);
+          emitFieldStore(Builder, MagicFieldIdx, *RM.StaticMagic);
         } else {
-          emitBloomMagicStore(Builder, HintGV, RM.BasePointers, MagicFieldIdx);
+          emitBloomMagicStore(Builder, RM.BasePointers, MagicFieldIdx);
         }
       }
       Stats.RangedSets++;
@@ -219,25 +219,25 @@ instrumentRegions(Function &F, DensityResult &Plan, GlobalVariable *HintGV,
       Instruction *InsertPoint = RM.Inst->getNextNode();
       if (InsertPoint) {
         IRBuilder<> Builder(InsertPoint);
-        emitFieldStore(Builder, HintGV, FieldIdx, 0);  // Clear tag
+        emitFieldStore(Builder, FieldIdx, 0);  // Clear tag
         if (EmitBloomMagic) {
           // Clear magic field too
           if (RM.StaticMagic.has_value()) {
-            emitFieldStore(Builder, HintGV, MagicFieldIdx, 0); // Clear static magic
+            emitFieldStore(Builder, MagicFieldIdx, 0); // Clear static magic
           } else {
-            emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);  // Empty = 0
+            emitBloomMagicStore(Builder, {}, MagicFieldIdx);  // Empty = 0
           }
         }
       } else {
         // EndInst is terminator, insert before it
         errs() << "[SchedTag] warning: EndInst is terminator, cannot insert CLR after\n";
         IRBuilder<> Builder(RM.Inst);
-        emitFieldStore(Builder, HintGV, FieldIdx, 0);
+        emitFieldStore(Builder, FieldIdx, 0);
         if (EmitBloomMagic) {
           if (RM.StaticMagic.has_value()) {
-            emitFieldStore(Builder, HintGV, MagicFieldIdx, 0);
+            emitFieldStore(Builder, MagicFieldIdx, 0);
           } else {
-            emitBloomMagicStore(Builder, HintGV, {}, MagicFieldIdx);
+            emitBloomMagicStore(Builder, {}, MagicFieldIdx);
           }
         }
       }
@@ -276,8 +276,22 @@ void print_label(sched_tag::SourceLabel & L) {
 // SchedTagPass::run — pure instrumentation, no analysis
 //===----------------------------------------------------------------------===//
 
+/// True for the sched_hint library symbols. They must never be instrumented
+/// themselves: a tag store inside @__sched_hint_register would call register
+/// again and recurse forever.
+static bool isSchedHintSupport(const Function &F) {
+  return F.getName().starts_with("__sched_hint_");
+}
+
 PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+
+  // Idempotence: if this module has already been instrumented (e.g. the
+  // optimizer-last EP ran, then an explicit -passes=sched-tag ran too), bail
+  // out: re-running would double-instrument every region and self-tag the
+  // library symbols.
+  if (M.getModuleFlag("sched_tag.instrumented"))
+    return PreservedAnalyses::all();
 
   // ---- Load source labels from sched_tags.json ----
   auto AllSourceLabels = parseSchedTagsJSON(SchedTagsFile);
@@ -328,7 +342,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   SmallVector<FuncPlans, 8> AllPlans;
 
   for (Function &F : M) {
-    if (F.isDeclaration())
+    if (F.isDeclaration() || isSchedHintSupport(F))
       continue;
     DensityResult ExecPlan, AtomicPlan;
     if (SchedAutoAnalysis) {
@@ -345,9 +359,12 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
     return PreservedAnalyses::all();
   }
 
-  // ---- Create the global variable and prctl constructor ----
-  GlobalVariable *HintGV = getOrCreateSchedHintGV(M);
-  emitPrctlConstructor(M, HintGV);
+  // Mark the module so a second run (optimizer-last EP plus an explicit
+  // -passes=sched-tag) cannot re-instrument it or tag the library symbols.
+  M.addModuleFlag(Module::Error, "sched_tag.instrumented", 1u);
+
+  // ---- Declare the library symbols (defined in libsched_tag) ----
+  declareHintRuntime(M);
 
   // ---- Deduplicate and instrument ----
   InstrStats TotalExec{}, TotalAtomic{}, TotalSource{};
@@ -371,7 +388,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
       // Make a copy to pass as non-const reference
       DensityResult RegionsCopy = SourceLabel.Regions;
-      auto S = instrumentRegions(F, RegionsCopy, HintGV, "SOURCE",
+      auto S = instrumentRegions(F, RegionsCopy, "SOURCE",
                                  FieldIndex, NeedsBloom);
       TotalSource.LoopSets += S.LoopSets;
       TotalSource.BBSets += S.BBSets;
@@ -412,7 +429,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
     // Instrument remaining regions
     if (!ExecPlan.empty()) {
-      auto S = instrumentRegions(F, ExecPlan, HintGV, "EXEC",
+      auto S = instrumentRegions(F, ExecPlan, "EXEC",
                                  FIELD_EXEC_DENSE, /*EmitBloomMagic=*/false,
                                  execMaskName);
       TotalExec.LoopSets += S.LoopSets;
@@ -420,7 +437,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
     }
 
     if (!AtomicPlan.empty()) {
-      auto S = instrumentRegions(F, AtomicPlan, HintGV, "ATOMIC",
+      auto S = instrumentRegions(F, AtomicPlan, "ATOMIC",
                                  FIELD_ATOMIC_DENSE,
                                  /*EmitBloomMagic=*/true);
       TotalAtomic.LoopSets += S.LoopSets;

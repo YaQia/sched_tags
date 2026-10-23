@@ -39,10 +39,11 @@ using namespace llvm;
 // guarded at instrumentation time by the DataLayout cross-check.
 //===----------------------------------------------------------------------===//
 
-static constexpr const char *SCHED_HINT_SECTION_NAME = "__sched_hint";
-#ifndef PR_SET_SCHED_HINT_OFFSET
-#define PR_SET_SCHED_HINT_OFFSET 83
-#endif
+// prctl(PR_SET_SCHED_HINT, &slot): register the calling thread; the kernel
+// back-fills the slot's user address. Mirrors PR_SET_SCHED_HINT in
+// <linux/prctl.h>. (The kernel owns the slot and maps it VM_SHARED, so there
+// is no userspace object to hand to the kernel any more.)
+static constexpr int PR_SET_SCHED_HINT = 83;
 
 // Bloom aliases so existing code keeps its short names; values come from the
 // shared ABI header (single source).
@@ -127,15 +128,14 @@ struct DensityResult {
 /// Create (or retrieve) the LLVM StructType matching struct sched_hint (64 B).
 llvm::StructType *getSchedHintType(llvm::LLVMContext &Ctx);
 
-/// Create (or reuse) the module-level TLS global with symbol name
-/// "__sched_hint.data". The period in the name makes it illegal to define in
-/// C/C++ source code, preventing user-space interference while maintaining
-/// link-time consistency.
-llvm::GlobalVariable *getOrCreateSchedHintGV(llvm::Module &M);
-
-/// Emit a module constructor that calls prctl(PR_SET_SCHED_HINT_OFFSET, ...)
-/// to register the TLS offset with the kernel.
-void emitPrctlConstructor(llvm::Module &M, llvm::GlobalVariable *HintGV);
+/// Declare the two library symbols this pass's instrumented code references:
+///
+///   @__sched_hint_ptr       per-thread slot cache
+///   @__sched_hint_register  per-thread prctl() registrar
+///
+/// They are defined once in libsched_tag, which the program must link. Emitting
+/// these per module would add one .init_array entry per translation unit.
+void declareHintRuntime(llvm::Module &M);
 
 /// Map a label type string to its corresponding struct field index.
 /// Returns {field index, needs bloom filter}, or std::nullopt for unknown
@@ -144,14 +144,15 @@ void emitPrctlConstructor(llvm::Module &M, llvm::GlobalVariable *HintGV);
 std::optional<std::pair<unsigned, bool>>
 getLabelTypeFieldIndex(llvm::StringRef LabelType);
 
-/// Generic helper: emit a store to a tag payload field.
+/// Generic helper: emit a store to a tag payload field of the current
+/// thread's kernel slot.
 ///
-///   store i8 <FieldValue>, &hint.<FieldIndex>
+///   store i8 <FieldValue>, &slot-><FieldIndex>
 ///
 /// The payload value itself serves as the activity indicator (non-zero =
 /// active).
-void emitFieldStore(llvm::IRBuilder<> &Builder, llvm::GlobalVariable *GV,
-                    unsigned FieldIndex, uint64_t FieldValue);
+void emitFieldStore(llvm::IRBuilder<> &Builder, unsigned FieldIndex,
+                    uint64_t FieldValue);
 
 
 /// Emit a bloom-filter hash of the given base pointers and store the result
@@ -162,7 +163,6 @@ void emitFieldStore(llvm::IRBuilder<> &Builder, llvm::GlobalVariable *GV,
 ///
 /// If BasePointers is empty, stores 0 (unknown — scheduler should not co-locate).
 void emitBloomMagicStore(::llvm::IRBuilder<> &Builder,
-                         ::llvm::GlobalVariable *GV,
                          ::llvm::ArrayRef<::llvm::Value *> BasePointers,
                          unsigned FieldIdx = FIELD_ATOMIC_MAGIC);
 

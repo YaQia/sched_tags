@@ -32,8 +32,9 @@ extern "C" {
 /*
  * Slot access: prctl(PR_SET_SCHED_HINT, &word) backfills this thread's slot
  * address (a 64-byte block of kernel-owned pages mapped into the process).
- * There is no userspace sched_hint object to reach for — readers call
- * sched_hint_current() (sched_tag.h), writers go through sched_tag_set().
+ * There is no userspace sched_hint object to reach for — the typed tag API
+ * lives in sched_tag.h (sched_tag_set / sched_tag_get / sched_tag_test_magic),
+ * which owns the slot and never hands out the raw struct.
  */
 
 #ifdef __cplusplus

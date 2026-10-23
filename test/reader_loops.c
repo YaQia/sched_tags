@@ -22,10 +22,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../include/sched_hint.h"
+#include "../include/sched_tag.h"
 
-/* The pass emits this TLS global in the __sched_hint section. */
-extern __thread struct sched_hint __sched_hint_data __asm__("__sched_hint.data");
 
 /* Functions from the instrumented module. */
 extern int    int_loop_dense(int n);
@@ -43,7 +41,7 @@ static int      observed_tag_id;
 static int      observe_count;
 
 void observe_hint(int tag_id) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
     observed_exec_dense = h->exec_dense;
     observed_tag_id       = tag_id;
     observe_count++;
@@ -93,7 +91,7 @@ static void check(const char *label, uint8_t expect_compute,
 /*=========================================================================*/
 
 int main(void) {
-    struct sched_hint *h = &__sched_hint_data;
+    struct sched_hint *h = __sched_hint_slot();
 
     printf("=== struct sched_hint ===\n");
     printf("magic:        0x%08x %s\n", h->magic,
@@ -102,7 +100,7 @@ int main(void) {
     printf("sizeof:       %zu bytes\n\n", sizeof(*h));
 
     if (h->magic != SCHED_HINT_MAGIC) {
-        printf("FATAL: bad magic — pass did not emit __sched_hint_data?\n");
+        printf("FATAL: hint slot unavailable (registration failed)?\n");
         return 1;
     }
 

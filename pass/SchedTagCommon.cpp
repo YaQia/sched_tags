@@ -6,6 +6,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace llvm;
@@ -48,176 +49,151 @@ StructType *getSchedHintType(LLVMContext &Ctx) {
 }
 
 //===----------------------------------------------------------------------===//
-// getOrCreateSchedHintGV — module-level TLS global with obfuscated name
+// Runtime declarations
 //===----------------------------------------------------------------------===//
 //
-// Symbol name: "__sched_hint.data"
+// The kernel owns the 64-byte slot and maps it VM_SHARED into the process, so
+// userspace only has to register each thread once via
+// prctl(PR_SET_SCHED_HINT, &slot); the kernel back-fills the slot's user
+// address.
 //
-// The period character makes this name illegal in C/C++ source code,
-// preventing user-space code from defining a conflicting variable.
-// This fixed name ensures link-time consistency across multiple compilation units.
+// The support symbols (the TLS cache, the registrar, the fork hook) live once
+// in libsched_tag, not emitted per module: a constructor emitted per
+// translation unit would add one .init_array entry per TU. This pass only
+// declares the two symbols its instrumented code references.
 
-static constexpr const char *SYMBOL_NAME = "__sched_hint.data";
+static constexpr const char *HINT_CACHE_SYMBOL = "__sched_hint_ptr";
 
-GlobalVariable *getOrCreateSchedHintGV(Module &M) {
-  LLVMContext &Ctx = M.getContext();
-  StructType *HintTy = getSchedHintType(Ctx);
+GlobalVariable *getOrCreateHintPtrCache(Module &M) {
+  if (GlobalVariable *GV = M.getNamedGlobal(HINT_CACHE_SYMBOL))
+    return GV;
 
-  // Contract cross-check: the FIELD_* GEP indices must land on the same
-  // byte offsets as the C layout in include/sched_hint.h (and the kernel's
-  // include/linux/sched/hint.h). A struct-type edit that breaks the ABI is
-  // caught here at instrumentation time instead of silently writing tags
-  // into the wrong fields.
-  const StructLayout *SL = M.getDataLayout().getStructLayout(HintTy);
-  auto CheckOffset = [&](unsigned FieldIdx, uint64_t ExpectOff,
-                         const char *Name) {
-    if (SL->getElementOffset(FieldIdx) != ExpectOff) {
-      errs() << "[SchedTag] ABI BROKEN: " << Name << " (field " << FieldIdx
-             << ") is at byte offset "
-             << SL->getElementOffset(FieldIdx) << ", expected " << ExpectOff
-             << ". getSchedHintType() and SchedTagCommon.h FIELD_* are out"
-             << " of sync with sched_hint.h!\n";
-    }
-  };
-  CheckOffset(FIELD_EXEC_DENSE, 8, "exec_dense");
-  CheckOffset(FIELD_MEMORY_DENSE, 9, "memory_dense");
-  CheckOffset(FIELD_ATOMIC_DENSE, 10, "atomic_dense");
-  CheckOffset(FIELD_UNSHARED, 11, "unshared");
-  CheckOffset(FIELD_LOAD_TREND, 12, "load_trend");
-  CheckOffset(FIELD_ATOMIC_MAGIC, 16, "atomic_magic");
-  CheckOffset(FIELD_DEP_MAGIC, 24, "dep_magic");
-  CheckOffset(FIELD_UNSHARED_MAGIC, 32, "unshared_magic");
-  CheckOffset(FIELD_DEP_ROLE, 40, "dep_role");
-  if (SL->getSizeInBytes() != 64)
-    errs() << "[SchedTag] ABI BROKEN: struct.sched_hint size is "
-           << SL->getSizeInBytes() << " bytes, expected 64!\n";
-
-  auto *I8 = Type::getInt8Ty(Ctx);
-  auto *I32 = Type::getInt32Ty(Ctx);
-  auto *I64 = Type::getInt64Ty(Ctx);
-
-  Constant *Init = ConstantStruct::get(
-      HintTy, {
-                  ConstantInt::get(I32, SCHED_HINT_MAGIC),
-                  ConstantInt::get(I32, SCHED_HINT_VERSION),
-                  ConstantInt::get(I8, SCHED_EXEC_NONE),  // exec_dense
-                  ConstantInt::get(I8, 0),                // memory_dense
-                  ConstantInt::get(I8, 0),                // atomic_dense
-                  ConstantInt::get(I8, 0),                // unshared
-                  ConstantInt::get(I8, SCHED_LOAD_NONE),  // load_trend
-                  ConstantAggregateZero::get(ArrayType::get(I8, 3)),  // reserved
-                  ConstantInt::get(I64, 0),               // atomic_magic
-                  ConstantInt::get(I64, 0),               // dep_magic
-                  ConstantInt::get(I64, 0),               // unshared_magic
-                  ConstantInt::get(I8, 0),                // dep_role
-                  ConstantAggregateZero::get(ArrayType::get(I8, 23)), // reserved2
-              });
-
-  // Check if a global with this name already exists
-  if (auto *Existing = M.getNamedGlobal(SYMBOL_NAME)) {
-    // If it's an external declaration, convert to definition
-    if (!Existing->hasInitializer()) {
-      Existing->setInitializer(Init);
-      Existing->setLinkage(GlobalValue::WeakAnyLinkage);
-      Existing->setThreadLocalMode(GlobalValue::InitialExecTLSModel);
-      Existing->setSection(SCHED_HINT_SECTION_NAME);
-      Existing->setAlignment(Align(64));
-      appendToUsed(M, {Existing});
-    }
-    return Existing;
-  }
-
-  // Create new global variable
-  auto *GV = new GlobalVariable(M, HintTy, /*isConstant=*/false,
-                                GlobalValue::WeakAnyLinkage, Init,
-                                SYMBOL_NAME);
-
+  auto *PtrTy = PointerType::getUnqual(M.getContext());
+  auto *GV = new GlobalVariable(M, PtrTy, /*isConstant=*/false,
+                                GlobalValue::ExternalLinkage,
+                                /*Initializer=*/nullptr, HINT_CACHE_SYMBOL);
   GV->setThreadLocalMode(GlobalValue::InitialExecTLSModel);
-  GV->setSection(SCHED_HINT_SECTION_NAME);
-  GV->setAlignment(Align(64));
-  appendToUsed(M, {GV});
-  
-  errs() << "[SchedTag] created TLS global: " << SYMBOL_NAME << "\n";
-  
   return GV;
 }
 
-//===----------------------------------------------------------------------===//
-// emitPrctlConstructor — register TLS offset with the kernel via prctl
-//===----------------------------------------------------------------------===//
-//
-// Generates a module constructor equivalent to:
-//
-//   __attribute__((constructor))
-//   void __sched_hint_report(void) {
-//       void *vaddr = &__sched_hint_data;
-//       void *tp    = __builtin_thread_pointer();
-//       long offset = (long)vaddr - (long)tp;
-//       prctl(PR_SET_SCHED_HINT_OFFSET, offset, vaddr, 0, 0);
-//   }
-//
-// The kernel uses `offset` for future child threads (TP + offset -> hint addr)
-// and `vaddr` directly for the calling (main) thread.
+// Per-thread registration, provided by libsched_tag: prctl back-fills the slot
+// address, then verifies the kernel stamped this build's magic/version into it
+// (an ABI guard), and caches the slot (or the sentinel (ptr)1 on failure).
+Function *getOrCreateRegisterFn(Module &M) {
+  if (Function *F = M.getFunction("__sched_hint_register"))
+    return F;
 
-void emitPrctlConstructor(Module &M, GlobalVariable *HintGV) {
-  LLVMContext &Ctx = M.getContext();
-  auto *I32 = Type::getInt32Ty(Ctx);
+  auto *PtrTy = PointerType::getUnqual(M.getContext());
+  return Function::Create(FunctionType::get(PtrTy, false),
+                          GlobalValue::ExternalLinkage, "__sched_hint_register",
+                          M);
+}
+
+void declareHintRuntime(Module &M) {
+  // Contract cross-check: the FIELD_* GEP indices must land on the same byte
+  // offsets as the C layout in include/sched_hint.h (and the kernel's
+  // include/linux/sched/hint.h). A struct-type edit that breaks the ABI is
+  // caught here at instrumentation time instead of silently writing tags into
+  // the wrong fields.
+  {
+    StructType *HintTy = getSchedHintType(M.getContext());
+    const StructLayout *SL = M.getDataLayout().getStructLayout(HintTy);
+    auto CheckOffset = [&](unsigned FieldIdx, uint64_t ExpectOff,
+                           const char *Name) {
+      if (SL->getElementOffset(FieldIdx) != ExpectOff)
+        errs() << "[SchedTag] ABI BROKEN: " << Name << " (field " << FieldIdx
+               << ") is at byte offset " << SL->getElementOffset(FieldIdx)
+               << ", expected " << ExpectOff
+               << ". getSchedHintType() and SchedTagCommon.h FIELD_* are out of"
+               << " sync with sched_hint.h!\n";
+    };
+    CheckOffset(FIELD_EXEC_DENSE, 8, "exec_dense");
+    CheckOffset(FIELD_MEMORY_DENSE, 9, "memory_dense");
+    CheckOffset(FIELD_ATOMIC_DENSE, 10, "atomic_dense");
+    CheckOffset(FIELD_UNSHARED, 11, "unshared");
+    CheckOffset(FIELD_LOAD_TREND, 12, "load_trend");
+    CheckOffset(FIELD_ATOMIC_MAGIC, 16, "atomic_magic");
+    CheckOffset(FIELD_DEP_MAGIC, 24, "dep_magic");
+    CheckOffset(FIELD_UNSHARED_MAGIC, 32, "unshared_magic");
+    CheckOffset(FIELD_DEP_ROLE, 40, "dep_role");
+    if (SL->getSizeInBytes() != 64)
+      errs() << "[SchedTag] ABI BROKEN: struct.sched_hint size is "
+             << SL->getSizeInBytes() << " bytes, expected 64!\n";
+  }
+
+  getOrCreateHintPtrCache(M);
+  getOrCreateRegisterFn(M);
+
+  errs() << "[SchedTag] referencing sched_hint library symbols (libsched_tag)\n";
+}
+
+//===----------------------------------------------------------------------===//
+// emitSlotStore — hot-path store into the current thread's kernel slot
+//===----------------------------------------------------------------------===//
+//
+// Hand-inlined on purpose: a helper call at every tag site would cost a call,
+// and the optimizer cannot recover it (this pass runs at the very end of the
+// pipeline, after the inliner). So the fast path is load-cache / test / store,
+// and only the cold registration is an out-of-line call.
+//
+// The current block is split at the insertion point so its original tail
+// (including any terminator) moves to a continuation block that every path
+// rejoins.
+static void emitSlotStore(IRBuilder<> &Builder, unsigned FieldIndex, Value *Val) {
+  LLVMContext &Ctx = Builder.getContext();
+  StructType *HintTy = getSchedHintType(Ctx);
+  auto *PtrTy = PointerType::getUnqual(Ctx);
   auto *I64 = Type::getInt64Ty(Ctx);
 
-  // void @__sched_hint_report()
-  FunctionType *CtorTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-  Function *Ctor = Function::Create(CtorTy, GlobalValue::InternalLinkage,
-                                    "__sched_hint_report", M);
+  Function *Fn = Builder.GetInsertBlock()->getParent();
+  Module *M = Fn->getParent();
+  GlobalVariable *Cache = getOrCreateHintPtrCache(*M);
+  Function *Register = getOrCreateRegisterFn(*M);
+  // Sentinel (ptr)1 == "registration failed, give up". Real slots are 64-byte
+  // aligned userspace addresses, so <= 1 is never a live slot.
+  Value *Disabled = ConstantExpr::getIntToPtr(ConstantInt::get(I64, 1), PtrTy);
 
-  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Ctor);
-  IRBuilder<> Builder(Entry);
+  BasicBlock *Head = Builder.GetInsertBlock();
+  Instruction *IP = &*Builder.GetInsertPoint();
+  Value *Cached = Builder.CreateLoad(PtrTy, Cache, "hint.cached");
+  Value *Unset = Builder.CreateICmpULE(Cached, Disabled, "hint.unset");
 
-  // %vaddr = ptrtoint ptr @__sched_hint_data to i64
-  Value *VAddr = Builder.CreatePtrToInt(HintGV, I64, "vaddr");
+  BasicBlock *Cont = SplitBlock(Head, IP);
+  Head->getTerminator()->eraseFromParent();
 
-  // %tp = call ptr @llvm.thread.pointer.p0()
-  Type *PtrTy = PointerType::getUnqual(Ctx);
-  Function *ThreadPtr =
-      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::thread_pointer, {PtrTy});
-  Value *TP = Builder.CreateCall(ThreadPtr, {}, "tp");
-  Value *TPInt = Builder.CreatePtrToInt(TP, I64, "tp.int");
+  BasicBlock *SlowBB = BasicBlock::Create(Ctx, "hint.slow", Fn, Cont);
+  BasicBlock *StoreBB = BasicBlock::Create(Ctx, "hint.store", Fn, Cont);
 
-  // %offset = sub i64 %vaddr, %tp.int
-  Value *Offset = Builder.CreateSub(VAddr, TPInt, "offset");
+  Builder.SetInsertPoint(Head);
+  Builder.CreateCondBr(Unset, SlowBB, StoreBB);
 
-  // Declare: int prctl(int option, ...)
-  FunctionType *PrctlTy = FunctionType::get(I32, {I32}, /*isVarArg=*/true);
-  FunctionCallee Prctl = M.getOrInsertFunction("prctl", PrctlTy);
+  Builder.SetInsertPoint(SlowBB);
+  Value *Slot = Builder.CreateCall(Register, {}, "hint.slot");
+  Value *Bad = Builder.CreateICmpULE(Slot, Disabled, "hint.bad");
+  Builder.CreateCondBr(Bad, Cont, StoreBB);
 
-  // call i32 (i32, ...) @prctl(i32 83, i64 %offset, i64 %vaddr, i32 0, i32 0)
-  Builder.CreateCall(Prctl, {ConstantInt::get(I32, PR_SET_SCHED_HINT_OFFSET),
-                             Offset, VAddr, ConstantInt::get(I32, 0),
-                             ConstantInt::get(I32, 0)});
+  Builder.SetInsertPoint(StoreBB);
+  PHINode *Base = Builder.CreatePHI(PtrTy, 2, "hint.base");
+  Base->addIncoming(Cached, Head);
+  Base->addIncoming(Slot, SlowBB);
+  Value *FieldPtr =
+      Builder.CreateStructGEP(HintTy, Base, FieldIndex, "hint.field");
+  Builder.CreateStore(Val, FieldPtr);
+  Builder.CreateBr(Cont);
 
-  Builder.CreateRetVoid();
-
-  // Append to @llvm.global_ctors (priority 65535 = default).
-  appendToGlobalCtors(M, Ctor, /*Priority=*/65535);
-
-  errs() << "[SchedTag] emitted prctl constructor __sched_hint_report()\n";
+  // Resume at the start of the continuation block (the split tail).
+  Builder.SetInsertPoint(Cont, Cont->begin());
 }
 
 //===----------------------------------------------------------------------===//
 // emitFieldStore — store a value to a tag payload field
 //===----------------------------------------------------------------------===//
 
-void emitFieldStore(IRBuilder<> &Builder, GlobalVariable *GV,
-                    unsigned FieldIndex, uint64_t FieldValue) {
-  LLVMContext &Ctx = Builder.getContext();
-  StructType *HintTy = getSchedHintType(Ctx);
-
-  // Store the value to the tag payload field.
-  Value *FieldPtr =
-      Builder.CreateStructGEP(HintTy, GV, FieldIndex, "hint.field.ptr");
-  
+void emitFieldStore(IRBuilder<> &Builder, unsigned FieldIndex,
+                    uint64_t FieldValue) {
+  StructType *HintTy = getSchedHintType(Builder.getContext());
   Type *FieldTy = HintTy->getElementType(FieldIndex);
-  Builder.CreateStore(ConstantInt::get(FieldTy, FieldValue),
-                      FieldPtr);
+  emitSlotStore(Builder, FieldIndex, ConstantInt::get(FieldTy, FieldValue));
 }
 
 //===----------------------------------------------------------------------===//
@@ -272,12 +248,10 @@ static Value *emitBloomBits(IRBuilder<> &Builder, Value *PtrVal) {
   return Bloom;
 }
 
-void emitBloomMagicStore(IRBuilder<> &Builder, GlobalVariable *GV,
-                         ArrayRef<Value *> BasePointers,
-                         unsigned FieldIdx) {
+void emitBloomMagicStore(IRBuilder<> &Builder,
+                         ArrayRef<Value *> BasePointers, unsigned FieldIdx) {
   LLVMContext &Ctx = Builder.getContext();
   auto *I64 = Type::getInt64Ty(Ctx);
-  StructType *HintTy = getSchedHintType(Ctx);
 
   Value *Magic;
   if (BasePointers.empty()) {
@@ -291,9 +265,7 @@ void emitBloomMagicStore(IRBuilder<> &Builder, GlobalVariable *GV,
     }
   }
 
-  Value *MagicPtr =
-      Builder.CreateStructGEP(HintTy, GV, FieldIdx, "hint.magic.ptr");
-  Builder.CreateStore(Magic, MagicPtr);
+  emitSlotStore(Builder, FieldIdx, Magic);
 }
 
 //===----------------------------------------------------------------------===//

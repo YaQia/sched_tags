@@ -833,6 +833,9 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
       if (*Type == "unshared" || *Type == "atomic-dense") {
         StaticMagic = static_cast<uint64_t>(*ValInt);
         Value = 1; // The payload field (unshared/atomic_dense) is just a boolean flag
+      } else if (*Type == "dependency") {
+        StaticMagic = static_cast<uint64_t>(*ValInt);
+        Value = SCHED_DEP_PRODUCER; // integer-only dependency defaults to producer role
       } else {
         Value = static_cast<uint8_t>(*ValInt);
       }
@@ -844,8 +847,8 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
       Value = parseSymbolicValue(*Type, *ValStr);
     } else {
       // No value field: use default (1 for boolean, warn for others)
-      if (*Type == "exec-dense" || *Type == "memory-dense" ||
-          *Type == "load-trend") {
+      if (*Type == "funit-dense" || *Type == "memory-dense" ||
+          *Type == "load-ahead") {
         errs() << "[SourceLabel] warning: label type '" << *Type
                << "' requires a 'value' field, using default 1\n";
       }
@@ -888,12 +891,12 @@ SmallVector<SourceLabel, 4> parseSchedTagsJSON(StringRef Path) {
 }
 
 //===----------------------------------------------------------------------===//
-// Symbolic value parsing for exec-dense, memory-dense, load-trend
+// Symbolic value parsing for funit-dense, memory-dense, dependency, load-ahead
 //===----------------------------------------------------------------------===//
 
 static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
-  if (Type == "exec-dense") {
-    // Parse exec type: "INT", "FLOAT", "SIMD", "CTRL", "INT|CTRL", etc.
+  if (Type == "funit-dense") {
+    // Parse funit type: "INT", "FLOAT", "SIMD", "CTRL", "INT|CTRL", etc.
     uint8_t Mask = 0;
     SmallVector<StringRef, 4> Parts;
     ValueStr.split(Parts, '|', -1, false);
@@ -901,20 +904,20 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
     for (StringRef Part : Parts) {
       Part = Part.trim();
       if (Part == "INT")
-        Mask |= SCHED_EXEC_INT;
+        Mask |= SCHED_FUNIT_INT;
       else if (Part == "FLOAT")
-        Mask |= SCHED_EXEC_FLOAT;
+        Mask |= SCHED_FUNIT_FLOAT;
       else if (Part == "SIMD")
-        Mask |= SCHED_EXEC_SIMD;
+        Mask |= SCHED_FUNIT_SIMD;
       else if (Part == "CTRL")
-        Mask |= SCHED_EXEC_CTRL;
+        Mask |= SCHED_FUNIT_CTRL;
       else if (Part == "NONE")
-        Mask = SCHED_EXEC_NONE;
+        Mask = SCHED_FUNIT_NONE;
       else
         errs() << "[SourceLabel] warning: unknown exec type '" << Part
                << "'\n";
     }
-    return Mask ? Mask : SCHED_EXEC_INT; // default to INT if nothing parsed
+    return Mask ? Mask : SCHED_FUNIT_INT; // default to INT if nothing parsed
   }
 
   if (Type == "memory-dense") {
@@ -933,8 +936,8 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
     }
   }
 
-  if (Type == "load-trend") {
-    // Parse load trend: "RISING", "FALLING", "NONE"
+  if (Type == "load-ahead") {
+    // Parse load phase: "RISING", "FALLING", "NONE"
     ValueStr = ValueStr.trim();
     if (ValueStr == "RISING")
       return SCHED_LOAD_RISING;
@@ -943,9 +946,25 @@ static uint8_t parseSymbolicValue(StringRef Type, StringRef ValueStr) {
     else if (ValueStr == "NONE")
       return SCHED_LOAD_NONE;
     else {
-      errs() << "[SourceLabel] warning: unknown load trend '" << ValueStr
+      errs() << "[SourceLabel] warning: unknown load phase '" << ValueStr
              << "', using RISING\n";
       return SCHED_LOAD_RISING;
+    }
+  }
+
+  if (Type == "dependency") {
+    // Parse dependency role: "PRODUCER", "CONSUMER", "NONE"
+    ValueStr = ValueStr.trim();
+    if (ValueStr == "PRODUCER")
+      return SCHED_DEP_PRODUCER;
+    else if (ValueStr == "CONSUMER")
+      return SCHED_DEP_CONSUMER;
+    else if (ValueStr == "NONE")
+      return SCHED_DEP_NONE;
+    else {
+      errs() << "[SourceLabel] warning: unknown dependency role '" << ValueStr
+             << "', using PRODUCER\n";
+      return SCHED_DEP_PRODUCER;
     }
   }
 

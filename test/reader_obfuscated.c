@@ -29,7 +29,7 @@ extern int trivial(int a);
 /*=========================================================================*/
 
 /* Snapshot captured by the most recent observe_hint call. */
-static uint8_t  observed_exec_dense;
+static uint8_t  observed_funit_dense;
 static int      observed_tag_id;
 static int      observe_count;
 static struct sched_hint *g_hint;  /* Global pointer to TLS variable */
@@ -39,7 +39,7 @@ void observe_hint(int tag_id) {
         fprintf(stderr, "ERROR: observe_hint called but g_hint is NULL\n");
         return;
     }
-    observed_exec_dense = g_hint->exec_dense;
+    observed_funit_dense = g_hint->funit_dense;
     observed_tag_id       = tag_id;
     observe_count++;
 }
@@ -50,21 +50,21 @@ void observe_hint(int tag_id) {
 
 static const char *exec_name(uint8_t t) {
     static char buf[32];
-    if (t == SCHED_EXEC_NONE) return "NONE";
+    if (t == SCHED_FUNIT_NONE) return "NONE";
     buf[0] = '\0';
-    if (t & SCHED_EXEC_INT) {
+    if (t & SCHED_FUNIT_INT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "INT");
     }
-    if (t & SCHED_EXEC_FLOAT) {
+    if (t & SCHED_FUNIT_FLOAT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "FLOAT");
     }
-    if (t & SCHED_EXEC_SIMD) {
+    if (t & SCHED_FUNIT_SIMD) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "SIMD");
     }
-    if (t & SCHED_EXEC_CTRL) {
+    if (t & SCHED_FUNIT_CTRL) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "CTRL");
     }
@@ -76,7 +76,7 @@ static int failures = 0;
 static void check(const char *label, uint8_t expect_compute,
                   uint8_t actual_compute) {
     int ok = (actual_compute == expect_compute);
-    printf("  [%-28s] exec_dense=%-5s  %s\n",
+    printf("  [%-28s] funit_dense=%-5s  %s\n",
            label,
            exec_name(actual_compute),
            ok ? "OK" : "FAIL");
@@ -108,8 +108,8 @@ int main(void) {
         return 1;
     }
 
-    /* Before any instrumented code runs, exec_dense should be 0. */
-    check("initial state", SCHED_EXEC_NONE, g_hint->exec_dense);
+    /* Before any instrumented code runs, funit_dense should be 0. */
+    check("initial state", SCHED_FUNIT_NONE, g_hint->funit_dense);
 
     /*
      * workload(20, 3.14): n > 10 → int_work path → SET INT.
@@ -122,7 +122,7 @@ int main(void) {
 
     /* Check what the callback saw DURING the dense region. */
     check("inside int_work (cb)",
-          SCHED_EXEC_INT, observed_exec_dense);
+          SCHED_FUNIT_INT, observed_funit_dense);
 
     /*
      * workload(5, 2.71): n <= 10 → float_work path → SET FLOAT.
@@ -134,7 +134,7 @@ int main(void) {
     printf("  result = %d\n", r2);
 
     check("inside float_work (cb)",
-          SCHED_EXEC_FLOAT, observed_exec_dense);
+          SCHED_FUNIT_FLOAT, observed_funit_dense);
 
     /*
      * trivial(42): no dense BBs → no SET → no callback.

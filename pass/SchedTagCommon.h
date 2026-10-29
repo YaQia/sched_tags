@@ -29,7 +29,7 @@ using namespace llvm;
 //===----------------------------------------------------------------------===//
 // Constants
 //
-// The ABI scalars (SCHED_HINT_MAGIC/VERSION, SCHED_EXEC_*, SCHED_MEMORY_*,
+// The ABI scalars (SCHED_HINT_MAGIC/VERSION, SCHED_FUNIT_*, SCHED_MEMORY_*,
 // SCHED_LOAD_*, SCHED_ATOMIC_*, SCHED_UNSHARED_*, SCHED_DEP_*) and the bloom
 // parameters (SCHED_HINT_BLOOM_PRIME/K) come from <linux/sched_hint.h> above.
 //
@@ -52,19 +52,19 @@ static constexpr uint64_t BLOOM_HASH_PRIME = SCHED_HINT_BLOOM_PRIME;
 
 // Struct field indices (must match getSchedHintType layout).
 // Header: magic(0), version(1)
-// Payload: exec_dense(2), memory_dense(3), atomic_dense(4), unshared(5),
-//          load_trend(6), reserved[3](7)
-static constexpr unsigned FIELD_EXEC_DENSE = 2;     // offset 8  (i8)
+// State bytes: funit_dense(2), memory_dense(3), atomic_dense(4), unshared(5),
+//          dep_role(6), load_ahead(7), reserved[2](8)
+static constexpr unsigned FIELD_FUNIT_DENSE = 2;    // offset 8  (i8)
 static constexpr unsigned FIELD_MEMORY_DENSE = 3;   // offset 9  (i8)
 static constexpr unsigned FIELD_ATOMIC_DENSE = 4;   // offset 10 (i8)
 static constexpr unsigned FIELD_UNSHARED = 5;       // offset 11 (i8)
-static constexpr unsigned FIELD_LOAD_TREND = 6;     // offset 12 (i8)
-static constexpr unsigned FIELD_RESERVED = 7;       // offset 13 ([3 x i8])
-// Extended payloads:
-static constexpr unsigned FIELD_ATOMIC_MAGIC = 8;   // offset 16 (i64)
-static constexpr unsigned FIELD_DEP_MAGIC = 9;      // offset 24 (i64)
-static constexpr unsigned FIELD_UNSHARED_MAGIC = 10; // offset 32 (i64)
-static constexpr unsigned FIELD_DEP_ROLE = 11;      // offset 40 (i8)
+static constexpr unsigned FIELD_DEP_ROLE = 6;       // offset 12 (i8)
+static constexpr unsigned FIELD_LOAD_AHEAD = 7;     // offset 13 (i8)
+static constexpr unsigned FIELD_RESERVED = 8;       // offset 14 ([2 x i8])
+// Magic words (mirror state-byte order):
+static constexpr unsigned FIELD_ATOMIC_MAGIC = 9;    // offset 16 (i64)
+static constexpr unsigned FIELD_UNSHARED_MAGIC = 10; // offset 24 (i64)
+static constexpr unsigned FIELD_DEP_MAGIC = 11;      // offset 32 (i64)
 
 //===----------------------------------------------------------------------===//
 // Analysis result types — the "instrumentation plan"

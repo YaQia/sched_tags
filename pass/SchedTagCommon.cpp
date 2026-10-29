@@ -30,17 +30,17 @@ StructType *getSchedHintType(LLVMContext &Ctx) {
                           {
                               I32,                    //  [0] magic
                               I32,                    //  [1] version
-                              I8,                     //  [2] exec_dense
+                              I8,                     //  [2] funit_dense
                               I8,                     //  [3] memory_dense
                               I8,                     //  [4] atomic_dense
                               I8,                     //  [5] unshared
-                              I8,                     //  [6] load_trend
-                              ArrayType::get(I8, 3),  //  [7] reserved[3]
-                              I64,                    //  [8] atomic_magic
-                              I64,                    //  [9] dep_magic
+                              I8,                     //  [6] dep_role
+                              I8,                     //  [7] load_ahead
+                              ArrayType::get(I8, 2),  //  [8] reserved[2]
+                              I64,                    //  [9] atomic_magic
                               I64,                    // [10] unshared_magic
-                              I8,                     // [11] dep_role
-                              ArrayType::get(I8, 23), // [12] reserved2[23]
+                              I64,                    // [11] dep_magic
+                              ArrayType::get(I8, 24), // [12] reserved2[24]
                           },
                           "struct.sched_hint",
                           /*isPacked=*/false);
@@ -107,15 +107,15 @@ void declareHintRuntime(Module &M) {
                << ". getSchedHintType() and SchedTagCommon.h FIELD_* are out of"
                << " sync with sched_hint.h!\n";
     };
-    CheckOffset(FIELD_EXEC_DENSE, 8, "exec_dense");
+    CheckOffset(FIELD_FUNIT_DENSE, 8, "funit_dense");
     CheckOffset(FIELD_MEMORY_DENSE, 9, "memory_dense");
     CheckOffset(FIELD_ATOMIC_DENSE, 10, "atomic_dense");
     CheckOffset(FIELD_UNSHARED, 11, "unshared");
-    CheckOffset(FIELD_LOAD_TREND, 12, "load_trend");
+    CheckOffset(FIELD_DEP_ROLE, 12, "dep_role");
+    CheckOffset(FIELD_LOAD_AHEAD, 13, "load_ahead");
     CheckOffset(FIELD_ATOMIC_MAGIC, 16, "atomic_magic");
-    CheckOffset(FIELD_DEP_MAGIC, 24, "dep_magic");
-    CheckOffset(FIELD_UNSHARED_MAGIC, 32, "unshared_magic");
-    CheckOffset(FIELD_DEP_ROLE, 40, "dep_role");
+    CheckOffset(FIELD_UNSHARED_MAGIC, 24, "unshared_magic");
+    CheckOffset(FIELD_DEP_MAGIC, 32, "dep_magic");
     if (SL->getSizeInBytes() != 64)
       errs() << "[SchedTag] ABI BROKEN: struct.sched_hint size is "
              << SL->getSizeInBytes() << " bytes, expected 64!\n";
@@ -347,8 +347,8 @@ std::optional<std::pair<unsigned, bool>>
 getLabelTypeFieldIndex(StringRef LabelType) {
   // Returns {field_index, needs_bloom_filter}
 
-  if (LabelType == "exec-dense")
-    return std::make_pair(FIELD_EXEC_DENSE, false);
+  if (LabelType == "funit-dense")
+    return std::make_pair(FIELD_FUNIT_DENSE, false);
 
   if (LabelType == "memory-dense")
     return std::make_pair(FIELD_MEMORY_DENSE, false);
@@ -359,14 +359,17 @@ getLabelTypeFieldIndex(StringRef LabelType) {
   if (LabelType == "unshared")
     return std::make_pair(FIELD_UNSHARED, true);       // bloom filter for unshared_magic
 
-  if (LabelType == "load-trend")
-    return std::make_pair(FIELD_LOAD_TREND, false);
+  if (LabelType == "dependency")
+    return std::make_pair(FIELD_DEP_ROLE, true);       // bloom filter for dep_magic
+
+  if (LabelType == "load-ahead")
+    return std::make_pair(FIELD_LOAD_AHEAD, false);
 
   // Unknown type: hard error. Silently guessing a field would corrupt an
   // unrelated tag, so the caller must skip this label entirely.
   errs() << "[SchedTag] error: unknown label type '" << LabelType
-         << "', skipping label (supported: exec-dense, memory-dense, "
-            "atomic-dense, unshared, load-trend)\n";
+         << "', skipping label (supported: funit-dense, memory-dense, "
+            "atomic-dense, unshared, dependency, load-ahead)\n";
   return std::nullopt;
 }
 

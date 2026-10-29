@@ -3,7 +3,7 @@
  *                               from sched_tags.json configuration.
  *
  * This tests:
- *   1. Single query labels (exec-dense, atomic-dense, load-trend)
+ *   1. Single query labels (funit-dense, atomic-dense, load-ahead)
  *   2. Ranged query labels (unshared with start/end)
  *   3. Proper SET/CLR behavior for ranged labels
  *
@@ -49,11 +49,11 @@ void mutex_unlock(void *m) {
 /*=========================================================================*/
 
 struct hint_snapshot {
-    uint8_t exec_dense;
+    uint8_t funit_dense;
     uint8_t memory_dense;
     uint8_t atomic_dense;
     uint8_t unshared;
-    uint8_t load_trend;
+    uint8_t load_ahead;
     uint64_t atomic_magic;
     uint64_t unshared_magic;
 };
@@ -64,11 +64,11 @@ static int snapshot_count = 0;
 void observe_hint(int tag_id) {
     struct sched_hint *h = __sched_hint_slot();
     if (tag_id < 100) {
-        snapshots[tag_id].exec_dense = h->exec_dense;
+        snapshots[tag_id].funit_dense = h->funit_dense;
         snapshots[tag_id].memory_dense = h->memory_dense;
         snapshots[tag_id].atomic_dense = h->atomic_dense;
         snapshots[tag_id].unshared = h->unshared;
-        snapshots[tag_id].load_trend = h->load_trend;
+        snapshots[tag_id].load_ahead = h->load_ahead;
         snapshots[tag_id].atomic_magic = h->atomic_magic;
         snapshots[tag_id].unshared_magic = h->unshared_magic;
     }
@@ -85,23 +85,23 @@ static const char *exec_type_name(uint8_t mask) {
     if (mask == 0) return "NONE";
     static char buf[32];
     buf[0] = '\0';
-    if (mask & SCHED_EXEC_INT) strcat(buf, "INT");
-    if (mask & SCHED_EXEC_FLOAT) {
+    if (mask & SCHED_FUNIT_INT) strcat(buf, "INT");
+    if (mask & SCHED_FUNIT_FLOAT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "FLOAT");
     }
-    if (mask & SCHED_EXEC_SIMD) {
+    if (mask & SCHED_FUNIT_SIMD) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "SIMD");
     }
-    if (mask & SCHED_EXEC_CTRL) {
+    if (mask & SCHED_FUNIT_CTRL) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "CTRL");
     }
     return buf;
 }
 
-static const char *load_trend_name(uint8_t v) {
+static const char *load_ahead_name(uint8_t v) {
     switch (v) {
     case SCHED_LOAD_NONE:    return "NONE";
     case SCHED_LOAD_RISING:  return "RISING";
@@ -133,11 +133,11 @@ static void check_exec(const char *label, uint8_t expect, uint8_t actual) {
 
 static void check_trend(const char *label, uint8_t expect, uint8_t actual) {
     int ok = (actual == expect);
-    printf("  [%-40s] trend=%s  %s\n", label, load_trend_name(actual),
+    printf("  [%-40s] trend=%s  %s\n", label, load_ahead_name(actual),
            ok ? "OK" : "FAIL");
     if (!ok) {
         printf("    expected %s, got %s\n",
-               load_trend_name(expect), load_trend_name(actual));
+               load_ahead_name(expect), load_ahead_name(actual));
         failures++;
     }
 }
@@ -165,14 +165,14 @@ int main(void) {
     snapshot_count = 0;
     
     /*---------------------------------------------------------------------*/
-    printf("--- Test 1: labeled_compute (exec-dense=INT + load-trend=RISING) ---\n");
+    printf("--- Test 1: labeled_compute (funit-dense=INT + load-ahead=RISING) ---\n");
     /*---------------------------------------------------------------------*/
     int r1 = labeled_compute(10);
     printf("  result = %d\n", r1);
-    check_exec("inside labeled_compute (tag 1)", SCHED_EXEC_INT,
-               snapshots[1].exec_dense);
+    check_exec("inside labeled_compute (tag 1)", SCHED_FUNIT_INT,
+               snapshots[1].funit_dense);
     check_trend("inside labeled_compute (tag 1)", SCHED_LOAD_RISING,
-                snapshots[1].load_trend);
+                snapshots[1].load_ahead);
     printf("\n");
     
     /*---------------------------------------------------------------------*/
@@ -215,7 +215,7 @@ int main(void) {
     printf("--- Test 5: unlabeled_function (no source labels for this func) ---\n");
     /*---------------------------------------------------------------------*/
     /*
-     * NOTE: Non-ranged labels (exec-dense, atomic-dense, etc.) persist
+     * NOTE: Non-ranged labels (funit-dense, atomic-dense, etc.) persist
      * until quiescent (handled by scheduler), NOT until function return.
      * So previous labels may still be visible here. This is expected behavior.
      * 
@@ -224,8 +224,8 @@ int main(void) {
     int r5 = unlabeled_function(100);
     printf("  result = %d\n", r5);
     printf("  [note: non-ranged labels persist until quiescent]\n");
-    printf("  exec_dense=%u (may be non-zero from previous calls)\n",
-           snapshots[99].exec_dense);
+    printf("  funit_dense=%u (may be non-zero from previous calls)\n",
+           snapshots[99].funit_dense);
     printf("  atomic_dense=%u (may be non-zero from previous calls)\n",
            snapshots[99].atomic_dense);
     /* Only unshared should be 0 because it was explicitly cleared */
@@ -234,12 +234,12 @@ int main(void) {
     printf("\n");
 
     /*---------------------------------------------------------------------*/
-    printf("--- Test 7: branchy_code (exec-dense=CTRL via source label) ---\n");
+    printf("--- Test 7: branchy_code (funit-dense=CTRL via source label) ---\n");
     /*---------------------------------------------------------------------*/
     int r7 = branchy_code(5, 3);
     printf("  result = %d\n", r7);
-    check_exec("inside branchy_code (tag 50)", SCHED_EXEC_CTRL,
-               snapshots[50].exec_dense);
+    check_exec("inside branchy_code (tag 50)", SCHED_FUNIT_CTRL,
+               snapshots[50].funit_dense);
     printf("\n");
     
     /*---------------------------------------------------------------------*/

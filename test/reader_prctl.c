@@ -72,18 +72,18 @@ int main(void) {
     check("prctl(PR_SET_SCHED_HINT) called",
           g_called && g_option == PR_SET_SCHED_HINT);
     check("back-fill pointer non-NULL", g_uptr != NULL);
-    check("exec_dense=INT stored into slot",
-          g_fake_slot.exec_dense == SCHED_EXEC_INT);
+    check("funit_dense=INT stored into slot",
+          g_fake_slot.funit_dense == SCHED_FUNIT_INT);
     check("sched_tag_get() reads it back",
-          sched_tag_get(EXEC_DENSE) == SCHED_EXEC_INT);
+          sched_tag_get(FUNIT_DENSE) == SCHED_FUNIT_INT);
 
     /* Registration is once per thread: a later tag must not re-register. */
     g_called = 0;
     int r2 = workload(5, 2.71);
     printf("  workload(5, 2.71) = %d\n", r2);
     check("no second prctl once cached", !g_called);
-    check("exec_dense=FLOAT stored into slot",
-          g_fake_slot.exec_dense == SCHED_EXEC_FLOAT);
+    check("funit_dense=FLOAT stored into slot",
+          g_fake_slot.funit_dense == SCHED_FUNIT_FLOAT);
 
     (void)trivial(42);
 

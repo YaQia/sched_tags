@@ -1,4 +1,4 @@
-#include "ExecDenseAnalysis.h"
+#include "FunitDenseAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -11,7 +11,7 @@ using namespace llvm;
 namespace sched_tag {
 
 //===----------------------------------------------------------------------===//
-// Thresholds (exec-dense specific)
+// Thresholds (funit-dense specific)
 //===----------------------------------------------------------------------===//
 
 static constexpr unsigned MIN_BB_SIZE = 10;
@@ -33,20 +33,20 @@ static constexpr double CTRL_DENSE_THRESHOLD = 0.08;
 // Per-instruction classification
 //===----------------------------------------------------------------------===//
 
-ExecOpType execOpType(Instruction &I) {
+FunitOpType funitOpType(Instruction &I) {
   // Control-flow pressure: conditional branches and multi-way branches.
   // An unconditional br is straight-line flow, not a decision.
   if (auto *BI = dyn_cast<BranchInst>(&I))
-    return BI->isConditional() ? ExecOpType::CTRL : ExecOpType::NONE;
+    return BI->isConditional() ? FunitOpType::CTRL : FunitOpType::NONE;
   if (isa<SwitchInst>(I) || isa<IndirectBrInst>(I))
-    return ExecOpType::CTRL;
+    return FunitOpType::CTRL;
 
   // Exclude non-compute instructions.
   // Use CallBase to cover both CallInst and InvokeInst (C++/Rust exceptions)
   if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<PHINode>(I) ||
       isa<SelectInst>(I) || isa<AllocaInst>(I) || I.isTerminator() ||
       isa<CallBase>(I))
-    return ExecOpType::NONE;
+    return FunitOpType::NONE;
 
   bool isIntOp = false, isFloatOp = false;
   switch (I.getOpcode()) {
@@ -91,10 +91,10 @@ ExecOpType execOpType(Instruction &I) {
   case Instruction::ExtractElement:
   case Instruction::InsertElement:
   case Instruction::ShuffleVector:
-    return ExecOpType::SIMD;
+    return FunitOpType::SIMD;
 
   default:
-    return ExecOpType::NONE;
+    return FunitOpType::NONE;
   }
 
   // Vector operands -> SIMD regardless of opcode category.
@@ -103,20 +103,20 @@ ExecOpType execOpType(Instruction &I) {
         return U->getType()->isVectorTy();
       });
   if (isVector)
-    return ExecOpType::SIMD;
+    return FunitOpType::SIMD;
 
   if (isIntOp)
-    return ExecOpType::INT;
+    return FunitOpType::INT;
   if (isFloatOp)
-    return ExecOpType::FLOAT;
-  return ExecOpType::NONE;
+    return FunitOpType::FLOAT;
+  return FunitOpType::NONE;
 }
 
 //===----------------------------------------------------------------------===//
 // Helper: classify from counts + threshold
 //===----------------------------------------------------------------------===//
 
-/// Return a bitmask of SCHED_EXEC_* bits.
+/// Return a bitmask of SCHED_FUNIT_* bits.
 ///
 /// - The CTRL bit is set independently of the arithmetic gate: a branchy
 ///   region with little arithmetic is exactly the CTRL-only profile the
@@ -129,36 +129,36 @@ static uint8_t classifyFromCounts(uint32_t IntCnt, uint32_t FloatCnt,
                                   uint32_t SIMDCnt, uint32_t CTRLCnt,
                                   uint32_t Total, double Threshold) {
   if (Total == 0)
-    return SCHED_EXEC_NONE;
+    return SCHED_FUNIT_NONE;
 
   uint8_t Mask = 0;
 
   if (CTRLCnt > 0 &&
       static_cast<double>(CTRLCnt) / Total >= CTRL_DENSE_THRESHOLD)
-    Mask |= SCHED_EXEC_CTRL;
+    Mask |= SCHED_FUNIT_CTRL;
 
   uint32_t ArithTotal = IntCnt + FloatCnt + SIMDCnt;
   if (static_cast<double>(ArithTotal) / Total >= Threshold) {
     double AT = static_cast<double>(ArithTotal);
     if (IntCnt > 0 && IntCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
-      Mask |= SCHED_EXEC_INT;
+      Mask |= SCHED_FUNIT_INT;
     if (FloatCnt > 0 &&
         FloatCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
-      Mask |= SCHED_EXEC_FLOAT;
+      Mask |= SCHED_FUNIT_FLOAT;
     if (SIMDCnt > 0 &&
         SIMDCnt / AT >= std::max(PER_TYPE_THRES, Threshold / 3))
-      Mask |= SCHED_EXEC_SIMD;
+      Mask |= SCHED_FUNIT_SIMD;
   }
   return Mask;
 }
 
 //===----------------------------------------------------------------------===//
-// ExecDense::run — unified density analysis
+// FunitDense::run — unified density analysis
 //===----------------------------------------------------------------------===//
 
-AnalysisKey ExecDense::Key;
+AnalysisKey FunitDense::Key;
 
-ExecDense::Result ExecDense::run(Function &F,
+FunitDense::Result FunitDense::run(Function &F,
                                  FunctionAnalysisManager &FAM) {
   DensityResult Plan;
 
@@ -178,17 +178,17 @@ ExecDense::Result ExecDense::run(Function &F,
     BBCounts C;
     for (Instruction &I : BB) {
       C.Total++;
-      switch (execOpType(I)) {
-      case ExecOpType::INT:
+      switch (funitOpType(I)) {
+      case FunitOpType::INT:
         C.IntCnt++;
         break;
-      case ExecOpType::FLOAT:
+      case FunitOpType::FLOAT:
         C.FloatCnt++;
         break;
-      case ExecOpType::SIMD:
+      case FunitOpType::SIMD:
         C.SIMDCnt++;
         break;
-      case ExecOpType::CTRL:
+      case FunitOpType::CTRL:
         C.CTRLCnt++;
         break;
       default:
@@ -244,7 +244,7 @@ ExecDense::Result ExecDense::run(Function &F,
 
     uint8_t LoopMask = classifyFromCounts(IntCnt, FloatCnt, SIMDCnt, CTRLCnt,
                                           Total, LOOP_DENSE_THRESHOLD);
-    if (LoopMask == SCHED_EXEC_NONE) {
+    if (LoopMask == SCHED_FUNIT_NONE) {
       for (Loop *Sub : L->getSubLoops())
         Worklist.push_back(Sub);
       continue;
@@ -283,7 +283,7 @@ ExecDense::Result ExecDense::run(Function &F,
 
     uint8_t BBMask = classifyFromCounts(C.IntCnt, C.FloatCnt, C.SIMDCnt,
                                         C.CTRLCnt, C.Total, BB_DENSE_THRESHOLD);
-    if (BBMask == SCHED_EXEC_NONE)
+    if (BBMask == SCHED_FUNIT_NONE)
       continue;
 
     Plan.StandaloneBBs.push_back({&BB, BBMask});

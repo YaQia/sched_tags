@@ -42,13 +42,13 @@ int rust_eh_personality(void) { return 0; }
 /* Observation callback — called from inside dense regions in the Rust IR  */
 /*=========================================================================*/
 
-static uint8_t  observed_exec_dense;
+static uint8_t  observed_funit_dense;
 static int      observed_tag_id;
 static int      observe_count;
 
 void observe_hint(int tag_id) {
     struct sched_hint *h = __sched_hint_slot();
-    observed_exec_dense = h->exec_dense;
+    observed_funit_dense = h->funit_dense;
     observed_tag_id        = tag_id;
     observe_count++;
 }
@@ -59,21 +59,21 @@ void observe_hint(int tag_id) {
 
 static const char *exec_name(uint8_t t) {
     static char buf[32];
-    if (t == SCHED_EXEC_NONE) return "NONE";
+    if (t == SCHED_FUNIT_NONE) return "NONE";
     buf[0] = '\0';
-    if (t & SCHED_EXEC_INT) {
+    if (t & SCHED_FUNIT_INT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "INT");
     }
-    if (t & SCHED_EXEC_FLOAT) {
+    if (t & SCHED_FUNIT_FLOAT) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "FLOAT");
     }
-    if (t & SCHED_EXEC_SIMD) {
+    if (t & SCHED_FUNIT_SIMD) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "SIMD");
     }
-    if (t & SCHED_EXEC_CTRL) {
+    if (t & SCHED_FUNIT_CTRL) {
         if (buf[0]) strcat(buf, "|");
         strcat(buf, "CTRL");
     }
@@ -85,7 +85,7 @@ static int failures = 0;
 static void check(const char *label, uint8_t expect_compute,
                   uint8_t actual_compute) {
     int ok = (actual_compute == expect_compute);
-    printf("  [%-30s] exec_dense=%-5s  %s\n",
+    printf("  [%-30s] funit_dense=%-5s  %s\n",
            label,
            exec_name(actual_compute),
            ok ? "OK" : "FAIL");
@@ -111,7 +111,7 @@ int main(void) {
     }
 
     /* Initial state: nothing active */
-    check("initial state", SCHED_EXEC_NONE, h->exec_dense);
+    check("initial state", SCHED_FUNIT_NONE, h->funit_dense);
 
     /* ---- rust_int_work: BB-level INT ---- */
     printf("\n--- rust_int_work(20) [INT-dense BB] ---\n");
@@ -120,7 +120,7 @@ int main(void) {
     printf("  result = %d, observe_count = %d\n", r1, observe_count);
 
     check("inside int_work (cb)",
-          SCHED_EXEC_INT, observed_exec_dense);
+          SCHED_FUNIT_INT, observed_funit_dense);
 
     /* ---- rust_float_work: BB-level FLOAT ---- */
     /* After -O1, fptosi becomes @llvm.fptosi.sat (a CallInst → NONE),
@@ -131,7 +131,7 @@ int main(void) {
     printf("  result = %d, observe_count = %d\n", r2, observe_count);
 
     check("inside float_work (cb)",
-          SCHED_EXEC_FLOAT, observed_exec_dense);
+          SCHED_FUNIT_FLOAT, observed_funit_dense);
 
     /* ---- rust_mixed_work: BB-level INT|FLOAT (bitmask replaces MIXED) ---- */
     printf("\n--- rust_mixed_work(42, 2.71) [INT|FLOAT-dense BB] ---\n");
@@ -140,7 +140,7 @@ int main(void) {
     printf("  result = %f, observe_count = %d\n", r3, observe_count);
 
     check("inside mixed_work (cb)",
-          SCHED_EXEC_INT | SCHED_EXEC_FLOAT, observed_exec_dense);
+          SCHED_FUNIT_INT | SCHED_FUNIT_FLOAT, observed_funit_dense);
 
     /* ---- rust_int_loop: loop-level INT|CTRL ---- */
     /* The loop body's conditional exit branch pushes branch density over
@@ -152,7 +152,7 @@ int main(void) {
     printf("  result = %d, observe_count = %d\n", r4, observe_count);
 
     check("inside int_loop (cb)",
-          SCHED_EXEC_INT | SCHED_EXEC_CTRL, observed_exec_dense);
+          SCHED_FUNIT_INT | SCHED_FUNIT_CTRL, observed_funit_dense);
 
     /* ---- rust_trivial: no instrumentation ---- */
     printf("\n--- rust_trivial(42) [no dense regions] ---\n");

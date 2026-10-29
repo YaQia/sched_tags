@@ -6,7 +6,7 @@
 //                  and inserts hint stores.
 //
 // This pass:
-//   1. Runs per-function density analyses (ExecDense, AtomicDense, ...).
+//   1. Runs per-function density analyses (FunitDense, AtomicDense, ...).
 //   2. Declares the sched_hint library symbols its instrumented code references
 //      (the per-thread slot cache and registrar, defined in libsched_tag).
 //   3. Instruments dense region boundaries with SET / CLR stores into the

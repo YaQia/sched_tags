@@ -1,6 +1,6 @@
 #include "SchedTagPass.h"
 #include "AtomicDenseAnalysis.h"
-#include "ExecDenseAnalysis.h"
+#include "FunitDenseAnalysis.h"
 #include "SchedTagCommon.h"
 #include "SourceLabelAnalysis.h"
 #include "llvm/ADT/STLExtras.h"
@@ -25,7 +25,7 @@ static cl::opt<std::string> SchedTagsFile(
 
 static cl::opt<bool> SchedAutoAnalysis(
     "sched-auto-analysis",
-    cl::desc("Enable automatic static analysis (ExecDense/AtomicDense)"),
+    cl::desc("Enable automatic static analysis (FunitDense/AtomicDense)"),
     cl::init(true),
     cl::Hidden);
 
@@ -35,26 +35,26 @@ namespace sched_tag {
 // Logging helpers
 //===----------------------------------------------------------------------===//
 
-static std::string execMaskName(uint8_t Mask) {
-  if (Mask == SCHED_EXEC_NONE)
+static std::string funitMaskName(uint8_t Mask) {
+  if (Mask == SCHED_FUNIT_NONE)
     return "NONE";
   std::string S;
-  if (Mask & SCHED_EXEC_INT) {
+  if (Mask & SCHED_FUNIT_INT) {
     if (!S.empty())
       S += "|";
     S += "INT";
   }
-  if (Mask & SCHED_EXEC_FLOAT) {
+  if (Mask & SCHED_FUNIT_FLOAT) {
     if (!S.empty())
       S += "|";
     S += "FLOAT";
   }
-  if (Mask & SCHED_EXEC_SIMD) {
+  if (Mask & SCHED_FUNIT_SIMD) {
     if (!S.empty())
       S += "|";
     S += "SIMD";
   }
-  if (Mask & SCHED_EXEC_CTRL) {
+  if (Mask & SCHED_FUNIT_CTRL) {
     if (!S.empty())
       S += "|";
     S += "CTRL";
@@ -140,9 +140,11 @@ instrumentRegions(Function &F, DensityResult &Plan,
   InstrStats Stats;
 
   // Determine which magic field to use based on tag type
-  unsigned MagicFieldIdx = (FieldIdx == FIELD_UNSHARED) 
-                           ? FIELD_UNSHARED_MAGIC 
-                           : FIELD_ATOMIC_MAGIC;
+  unsigned MagicFieldIdx = FIELD_ATOMIC_MAGIC;
+  if (FieldIdx == FIELD_UNSHARED)
+    MagicFieldIdx = FIELD_UNSHARED_MAGIC;
+  else if (FieldIdx == FIELD_DEP_ROLE)
+    MagicFieldIdx = FIELD_DEP_MAGIC;
 
   // --- Loop-level instrumentation ---
   for (auto &LR : Plan.Loops) {
@@ -335,7 +337,7 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
   struct FuncPlans {
     Function *F;
-    DensityResult Exec;
+    DensityResult Funit;
     DensityResult Atomic;
     SourceLabelResults Source;
   };
@@ -344,14 +346,14 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   for (Function &F : M) {
     if (F.isDeclaration() || isSchedHintSupport(F))
       continue;
-    DensityResult ExecPlan, AtomicPlan;
+    DensityResult FunitPlan, AtomicPlan;
     if (SchedAutoAnalysis) {
-      ExecPlan = FAM.getResult<ExecDense>(F);
+      FunitPlan = FAM.getResult<FunitDense>(F);
       AtomicPlan = FAM.getResult<AtomicDense>(F);
     }
     auto SourcePlan = FAM.getResult<SourceLabelAnalysis>(F);
-    if (!ExecPlan.empty() || !AtomicPlan.empty() || !SourcePlan.empty())
-      AllPlans.push_back({&F, std::move(ExecPlan), std::move(AtomicPlan),
+    if (!FunitPlan.empty() || !AtomicPlan.empty() || !SourcePlan.empty())
+      AllPlans.push_back({&F, std::move(FunitPlan), std::move(AtomicPlan),
                           std::move(SourcePlan)});
   }
 
@@ -367,10 +369,10 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
   declareHintRuntime(M);
 
   // ---- Deduplicate and instrument ----
-  InstrStats TotalExec{}, TotalAtomic{}, TotalSource{};
+  InstrStats TotalFunit{}, TotalAtomic{}, TotalSource{};
   unsigned DeduplicatedLoops = 0, DeduplicatedBBs = 0;
 
-  for (auto &[FuncPtr, ExecPlan, AtomicPlan, SourcePlan] : AllPlans) {
+  for (auto &[FuncPtr, FunitPlan, AtomicPlan, SourcePlan] : AllPlans) {
     Function &F = *FuncPtr;
 
     // First, instrument source labels (highest priority)
@@ -409,31 +411,31 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
     }
 
     // Then deduplicate automatic analyses against source labels
-    size_t ExecLoopsBefore = ExecPlan.Loops.size();
-    size_t ExecBBsBefore = ExecPlan.StandaloneBBs.size();
+    size_t FunitLoopsBefore = FunitPlan.Loops.size();
+    size_t FunitBBsBefore = FunitPlan.StandaloneBBs.size();
     size_t AtomicLoopsBefore = AtomicPlan.Loops.size();
     size_t AtomicBBsBefore = AtomicPlan.StandaloneBBs.size();
 
-    deduplicateRegions(ExecPlan, CombinedSourcePlan);
+    deduplicateRegions(FunitPlan, CombinedSourcePlan);
     deduplicateRegions(AtomicPlan, CombinedSourcePlan);
 
-    size_t ExecLoopsAfter = ExecPlan.Loops.size();
-    size_t ExecBBsAfter = ExecPlan.StandaloneBBs.size();
+    size_t FunitLoopsAfter = FunitPlan.Loops.size();
+    size_t FunitBBsAfter = FunitPlan.StandaloneBBs.size();
     size_t AtomicLoopsAfter = AtomicPlan.Loops.size();
     size_t AtomicBBsAfter = AtomicPlan.StandaloneBBs.size();
 
-    DeduplicatedLoops += (ExecLoopsBefore - ExecLoopsAfter) +
+    DeduplicatedLoops += (FunitLoopsBefore - FunitLoopsAfter) +
                          (AtomicLoopsBefore - AtomicLoopsAfter);
-    DeduplicatedBBs += (ExecBBsBefore - ExecBBsAfter) +
+    DeduplicatedBBs += (FunitBBsBefore - FunitBBsAfter) +
                        (AtomicBBsBefore - AtomicBBsAfter);
 
     // Instrument remaining regions
-    if (!ExecPlan.empty()) {
-      auto S = instrumentRegions(F, ExecPlan, "EXEC",
-                                 FIELD_EXEC_DENSE, /*EmitBloomMagic=*/false,
-                                 execMaskName);
-      TotalExec.LoopSets += S.LoopSets;
-      TotalExec.BBSets += S.BBSets;
+    if (!FunitPlan.empty()) {
+      auto S = instrumentRegions(F, FunitPlan, "FUNIT",
+                                 FIELD_FUNIT_DENSE, /*EmitBloomMagic=*/false,
+                                 funitMaskName);
+      TotalFunit.LoopSets += S.LoopSets;
+      TotalFunit.BBSets += S.BBSets;
     }
 
     if (!AtomicPlan.empty()) {
@@ -447,8 +449,8 @@ PreservedAnalyses SchedTagPass::run(Module &M, ModuleAnalysisManager &MAM) {
 
   errs() << "[SchedTag] instrumented across " << AllPlans.size()
          << " functions:\n";
-  errs() << "[SchedTag]   exec:    " << TotalExec.LoopSets << " loop-SET, "
-         << TotalExec.BBSets << " bb-SET\n";
+  errs() << "[SchedTag]   funit:   " << TotalFunit.LoopSets << " loop-SET, "
+         << TotalFunit.BBSets << " bb-SET\n";
   errs() << "[SchedTag]   atomic:  " << TotalAtomic.LoopSets << " loop-SET, "
          << TotalAtomic.BBSets << " bb-SET\n";
   errs() << "[SchedTag]   source:  " << TotalSource.LoopSets << " loop-SET, "
@@ -497,7 +499,7 @@ llvm::PassPluginLibraryInfo getSchedTagPluginInfo() {
             // Register all per-function analyses.
             PB.registerAnalysisRegistrationCallback(
                 [](FunctionAnalysisManager &FAM) {
-                  FAM.registerPass([&] { return sched_tag::ExecDense(); });
+                  FAM.registerPass([&] { return sched_tag::FunitDense(); });
                   FAM.registerPass([&] { return sched_tag::AtomicDense(); });
                   FAM.registerPass([&] { return sched_tag::SourceLabelAnalysis(); });
                 });

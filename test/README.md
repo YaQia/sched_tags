@@ -67,7 +67,7 @@ test/
 分析中归类为 NONE，因此每个区域的指令数需要适当增加以保证加入
 call 后密度比仍然超过阈值。
 
-#### 计算密集 (exec_dense)
+#### 计算密集 (funit_dense)
 
 | 文件            | 函数                        | 观测点 ID | 测试目标                            |
 | --------------- | --------------------------- | --------- | ----------------------------------- |
@@ -94,12 +94,12 @@ call 后密度比仍然超过阈值。
 
 | 文件                    | 函数                  | 观测点 ID | 测试目标                              |
 | ----------------------- | --------------------- | --------- | ------------------------------------- |
-| `test_source_labels.ll` | `@labeled_compute`    | 1         | BB 级别 exec-dense=INT + load-trend=RISING |
+| `test_source_labels.ll` | `@labeled_compute`    | 1         | BB 级别 funit-dense=INT + load-ahead=RISING |
 | `test_source_labels.ll` | `@labeled_atomic_loop`| 10        | 循环级别 atomic-dense via source label |
 | `test_source_labels.ll` | `@critical_section`   | 20, 21    | 精确范围 unshared SET/CLR (ranged)    |
 | `test_source_labels.ll` | `@another_critical`   | 30, 31    | 精确范围 unshared SET/CLR (ranged)    |
 | `test_source_labels.ll` | `@unlabeled_function` | 99        | 无源标签 → 标签状态保持（设计行为）   |
-| `test_source_labels.ll` | `@branchy_code`       | 50        | exec-dense=CTRL via source label      |
+| `test_source_labels.ll` | `@branchy_code`       | 50        | funit-dense=CTRL via source label      |
 
 ### `reader*.c` — 运行时验证器
 
@@ -190,7 +190,7 @@ clang /tmp/tagged_rust.o test/reader_rust.c build/libsched_tag.a -lm -o /tmp/tes
 ### 测试 5: 源标签 (sched_tags.json)
 
 此测试验证从配置文件读取源标签的功能，包括：
-- 单查询标签 (exec-dense, atomic-dense, load-trend)
+- 单查询标签 (funit-dense, atomic-dense, load-ahead)
 - 精确范围标签 (unshared with start/end)
 - `func=` 谓词匹配调用目标
 
@@ -253,15 +253,15 @@ magic:        0x48494e54 (OK)
 version:      1
 sizeof:       64 bytes
 
-  [initial state               ] exec_dense=NONE   OK
+  [initial state               ] funit_dense=NONE   OK
 
 --- workload(20, 3.14) [int_work path] ---
   result = 8880
-  [inside int_work (cb)        ] exec_dense=INT    OK
+  [inside int_work (cb)        ] funit_dense=INT    OK
 
 --- workload(5, 2.71) [float_work path] ---
   result = 22
-  [inside float_work (cb)      ] exec_dense=FLOAT  OK
+  [inside float_work (cb)      ] funit_dense=FLOAT  OK
 
 --- trivial(42) [no dense BBs] ---
   result = 43
@@ -275,9 +275,9 @@ sizeof:       64 bytes
 === struct sched_hint ===
 magic:        0x48494e54 (OK)
 ...
-  [inside int loop (cb)              ] exec_dense=INT    OK
-  [inside float loop (cb)            ] exec_dense=FLOAT  OK
-  [inside dense_bb (cb)              ] exec_dense=INT    OK
+  [inside int loop (cb)              ] funit_dense=INT    OK
+  [inside float loop (cb)            ] funit_dense=FLOAT  OK
+  [inside dense_bb (cb)              ] funit_dense=INT    OK
 ...
 === ALL PASSED (0 failure(s)) ===
 ```

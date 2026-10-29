@@ -102,11 +102,12 @@ static inline struct sched_hint *__sched_hint_slot(void)
 
 /* Tag types corresponding to sched_hint fields */
 typedef enum {
-    EXEC_DENSE,
+    FUNIT_DENSE,
     MEMORY_DENSE,
     ATOMIC_DENSE,
     UNSHARED,
-    LOAD_TREND
+    DEP_ROLE,
+    LOAD_AHEAD
 } sched_tag_type_t;
 
 /* Bloom filter hash calculation (identical to the kernel's / LLVM pass logic).
@@ -144,11 +145,12 @@ static inline struct sched_hint *__sched_tag_set_base(sched_tag_type_t type, uin
     if (!hint)
         return NULL;
     switch (type) {
-        case EXEC_DENSE:    hint->exec_dense    = value; break;
+        case FUNIT_DENSE:   hint->funit_dense   = value; break;
         case MEMORY_DENSE:  hint->memory_dense  = value; break;
         case ATOMIC_DENSE:  hint->atomic_dense  = value; if (!value) hint->atomic_magic = 0; break;
         case UNSHARED:      hint->unshared      = value; if (!value) hint->unshared_magic = 0; break;
-        case LOAD_TREND:    hint->load_trend    = value; break;
+        case DEP_ROLE:      hint->dep_role      = value; if (!value) hint->dep_magic = 0; break;
+        case LOAD_AHEAD:    hint->load_ahead    = value; break;
     }
     return hint;
 }
@@ -159,6 +161,7 @@ static inline void __sched_tag_set_ptr(sched_tag_type_t type, uint8_t value, con
     if (hint && value && ptr) {
         if (type == ATOMIC_DENSE) __sched_tag_bloom_add(&hint->atomic_magic, ptr);
         else if (type == UNSHARED) __sched_tag_bloom_add(&hint->unshared_magic, ptr);
+        else if (type == DEP_ROLE) __sched_tag_bloom_add(&hint->dep_magic, ptr);
     }
 }
 
@@ -168,6 +171,7 @@ static inline void __sched_tag_set_id(sched_tag_type_t type, uint8_t value, uint
     if (hint && value && id) {
         if (type == ATOMIC_DENSE) hint->atomic_magic = id;
         else if (type == UNSHARED) hint->unshared_magic = id;
+        else if (type == DEP_ROLE) hint->dep_magic = id;
     }
 }
 
@@ -187,11 +191,12 @@ static inline uint8_t sched_tag_get(sched_tag_type_t type) {
     if (!hint)
         return 0;
     switch (type) {
-        case EXEC_DENSE:    return hint->exec_dense;
+        case FUNIT_DENSE:   return hint->funit_dense;
         case MEMORY_DENSE:  return hint->memory_dense;
         case ATOMIC_DENSE:  return hint->atomic_dense;
         case UNSHARED:      return hint->unshared;
-        case LOAD_TREND:    return hint->load_trend;
+        case DEP_ROLE:      return hint->dep_role;
+        case LOAD_AHEAD:    return hint->load_ahead;
     }
     return 0;
 }
@@ -220,6 +225,7 @@ static inline bool sched_tag_test_magic(sched_tag_type_t type, const void *ptr) 
     switch (type) {
         case ATOMIC_DENSE: stored = hint->atomic_magic; break;
         case UNSHARED:     stored = hint->unshared_magic; break;
+        case DEP_ROLE:     stored = hint->dep_magic; break;
         default:           return false;
     }
     want = __sched_tag_bloom_of(ptr);

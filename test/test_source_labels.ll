@@ -116,7 +116,7 @@ entry:
 }
 
 ;; ==========================================================================
-;; Test 7: exec-dense CTRL label via source label
+;; Test 7: funit-dense CTRL label via source label
 ;; ==========================================================================
 
 define i32 @branchy_code(i32 %x, i32 %y) {

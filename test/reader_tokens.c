@@ -58,13 +58,13 @@ static void reset_slot(void)
 int main(void)
 {
     int lock_a = 0, lock_b = 0, atomic_a = 0, atomic_b = 0;
-    int pipe_q1 = 0, pipe_q2 = 0;
+    int handoff_q1 = 0, handoff_q2 = 0;
     uint64_t key_a = sched_tag_key_ptr(&lock_a);
     uint64_t key_b = sched_tag_key_ptr(&lock_b);
     uint64_t ka = sched_tag_key_ptr(&atomic_a);
     uint64_t kb = sched_tag_key_ptr(&atomic_b);
-    uint64_t q1 = sched_tag_key_ptr(&pipe_q1);
-    uint64_t q2 = sched_tag_key_ptr(&pipe_q2);
+    uint64_t q1 = sched_tag_key_ptr(&handoff_q1);
+    uint64_t q2 = sched_tag_key_ptr(&handoff_q2);
 
     __sched_hint_ptr = &fake_slot;
 
@@ -133,36 +133,36 @@ int main(void)
         sched_tag_leave_atomic(&t);
     }
 
-    /* --- dep: pipe key + role, nesting, BOTH, static id --- */
+    /* --- dep: handoff key + role, nesting, BOTH, static id --- */
     reset_slot();
     {
-        struct sched_tag_token p = sched_tag_enter_dep(&pipe_q1,
+        struct sched_tag_token p = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_PRODUCER);
         check_u8("dep producer role", SCHED_DEP_PRODUCER, fake_slot.dep_role);
-        check_key("dep producer pipe", q1, fake_slot.dep_magic);
+        check_key("dep producer handoff", q1, fake_slot.dep_magic);
 
-        struct sched_tag_token c = sched_tag_enter_dep(&pipe_q2,
+        struct sched_tag_token c = sched_tag_enter_dep(&handoff_q2,
                                                        SCHED_DEP_CONSUMER);
         check_u8("dep consumer role", SCHED_DEP_CONSUMER, fake_slot.dep_role);
-        check_key("dep consumer pipe", q2, fake_slot.dep_magic);
+        check_key("dep consumer handoff", q2, fake_slot.dep_magic);
 
         sched_tag_leave_dep(&c);
         check_u8("dep leave restores producer role", SCHED_DEP_PRODUCER,
                  fake_slot.dep_role);
-        check_key("dep leave restores producer pipe", q1,
+        check_key("dep leave restores producer handoff", q1,
                   fake_slot.dep_magic);
 
         sched_tag_leave_dep(&p);
         check_u8("dep outer leave role", SCHED_DEP_NONE, fake_slot.dep_role);
-        check_key("dep outer leave pipe", 0, fake_slot.dep_magic);
+        check_key("dep outer leave handoff", 0, fake_slot.dep_magic);
     }
 
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_dep(&pipe_q1,
+        struct sched_tag_token t = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_BOTH);
         check_u8("dep BOTH role", SCHED_DEP_BOTH, fake_slot.dep_role);
-        check_key("dep BOTH pipe", q1, fake_slot.dep_magic);
+        check_key("dep BOTH handoff", q1, fake_slot.dep_magic);
         sched_tag_leave_dep(&t);
     }
 
@@ -170,17 +170,17 @@ int main(void)
     {
         struct sched_tag_token t = sched_tag_enter_dep_id(0xCAFEBABEULL,
                                                           SCHED_DEP_CONSUMER);
-        check_key("dep _id pipe", sched_tag_key_id(0xCAFEBABEULL),
+        check_key("dep _id handoff", sched_tag_key_id(0xCAFEBABEULL),
                   fake_slot.dep_magic);
         sched_tag_leave_dep(&t);
     }
 
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_dep(&pipe_q1,
+        struct sched_tag_token t = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_NONE);
         check_u8("dep NONE role", SCHED_DEP_NONE, fake_slot.dep_role);
-        check_key("dep NONE clears pipe", 0, fake_slot.dep_magic);
+        check_key("dep NONE clears handoff", 0, fake_slot.dep_magic);
         sched_tag_leave_dep(&t);
     }
 
@@ -221,7 +221,7 @@ int main(void)
 
     reset_slot();
     {
-        sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, &pipe_q1);
+        sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, &handoff_q1);
         check_u8("compat dep state", SCHED_DEP_CONSUMER, fake_slot.dep_role);
         check_key("compat dep key", q1, fake_slot.dep_magic);
         sched_tag_set(DEP_ROLE, SCHED_DEP_NONE);

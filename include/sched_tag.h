@@ -12,7 +12,7 @@
 |* Tag semantics (all magic words are exact 64-bit identity keys):            *|
 |*   unshared      current lock, overwrite + restore (nest by token)          *|
 |*   atomic_dense exact atomic-variable set hash, accumulate + clear/restore  *|
-|*   dep           current pipe + role, overwrite + restore (nest by token)   *|
+|*   dep           current handoff object + role, overwrite + restore        *|
 |*                                                                            *|
 |* Usage Examples:                                                            *|
 |*   1. unshared: current lock, nest-safe:                                    *|
@@ -27,7 +27,7 @@
 |*      lock_free_region();                                                   *|
 |*      sched_tag_leave_atomic(&t);                                           *|
 |*                                                                            *|
-|*   3. dep: current pipe + role, nest-safe:                                  *|
+|*   3. dep: current producer/consumer handoff object + role, nest-safe:      *|
 |*      struct sched_tag_token t =                                            *|
 |*          sched_tag_enter_dep(&q, SCHED_DEP_CONSUMER);                      *|
 |*      recv(q, ...);                                                         *|
@@ -293,7 +293,11 @@ static inline void sched_tag_leave_atomic(struct sched_tag_token *t)
 }
 
 /* ------------------------------------------------------------------------- */
-/* dep: current pipe + role, overwrite + restore                             */
+/* dep: current producer/consumer handoff object + role, overwrite + restore */
+/*                                                                           */
+/* The handoff object can be a pipe, queue, socket, channel, ring buffer, or  */
+/* any other shared object that moves work/data from producers to consumers. */
+/* The scheduler only sees (dep_magic, dep_role); the type is irrelevant.    */
 /* ------------------------------------------------------------------------- */
 
 static inline struct sched_tag_token
@@ -314,9 +318,9 @@ __sched_tag_enter_dep_key(uint64_t key, uint8_t role)
 }
 
 static inline struct sched_tag_token
-sched_tag_enter_dep(const void *pipe, uint8_t role)
+sched_tag_enter_dep(const void *handoff, uint8_t role)
 {
-    return __sched_tag_enter_dep_key(sched_tag_key_ptr(pipe), role);
+    return __sched_tag_enter_dep_key(sched_tag_key_ptr(handoff), role);
 }
 
 static inline struct sched_tag_token

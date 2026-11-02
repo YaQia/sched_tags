@@ -21,15 +21,15 @@
 
 ### 2. 带附加信息的标签
 
-这些标签同时有 **state byte** 和 **附加 magic key**：state 表示当前是否 active / role，magic 用于标识具体的 lock / 集合 / pipe。
+这些标签同时有 **state byte** 和 **附加 magic key**：state 表示当前是否 active / role，magic 用于标识具体的 lock / 集合 / 交接对象。
 
 | 标签           | state 值                                            | 附加信息（magic key）         | 写入方式                 | 调度器用途                                  |
 | -------------- | --------------------------------------------------- | ----------------------------- | ------------------------ | ------------------------------------------- |
 | `unshared`     | `SCHED_UNSHARED_HELD` / `NONE`                      | 当前唯一 lock 的 key          | 覆盖 + token 恢复        | 按 lock key 统计 waiter，决定是否扩展时间片 |
-| `atomic_dense` | `SCHED_ATOMIC_DENSE` / `NONE`                       | 原子变量集合的 exact set hash | XOR 累加 + clear/restore | 按集合 key 共置；集合完全相同才优化         |
-| `dep_role`     | `SCHED_DEP_NONE` / `PRODUCER` / `CONSUMER` / `BOTH` | 当前 pipe 的 key              | 覆盖 + token 恢复        | 按 pipe key + role 配对 producer/consumer   |
+| `atomic_dense` | `SCHED_ATOMIC_DENSE` / `NONE`                       | 原子变量集合的 exact set hash | XOR 累加 + clear/restore | 原子密集任务按集合 key 共置                 |
+| `dep_role`     | `SCHED_DEP_NONE` / `PRODUCER` / `CONSUMER` / `BOTH` | 当前交接对象的 key            | 覆盖 + token 恢复        | 生产者消费者模型的任务按交接对象 key 共置   |
 
-这三个标签的 magic 都是 **exact key**：只有 key 完全相等，才表示同一个 lock / 集合 / pipe。
+这三个标签的 magic 都是 **exact key**：只有 key 完全相等，才表示同一个 lock / 集合 / 交接对象。
 
 - pointer key：`hash64(ptr ^ per-process salt)`
 - static key：`hash64(id)`，用于跨进程对象
@@ -45,8 +45,10 @@
 #### `dep_role`
 
 - 值是一个 bitmask：`SCHED_DEP_NONE` / `PRODUCER` / `CONSUMER` / `BOTH`
-- `dep_magic` 表示当前 pipe；不同 pipe 用嵌套/顺序，不塞进多个 key
-- 同一个双向 pipe 可以同时是 `BOTH`
+- `dep_magic` 表示当前生产者/消费者共享的交接对象；pipe、queue、socket、channel、ring buffer 都可以
+- 交接对象必须在生产者和消费者两侧具有相同的 key；同进程可用指针，跨进程用静态 id
+- 不同交接对象用嵌套/顺序，不塞进多个 key
+- 同一个双向交接对象可以同时是 `BOTH`
 
 > Hints are sampled at scheduling hooks. A hint is only observed if it is active
 > at a hook. Short userspace-only regions may never be observed. Hints are
@@ -71,7 +73,7 @@ void process_data(void) {
     struct sched_tag_token t;
     int lock = 0;
     int counter_a = 0, counter_b = 0;
-    int pipe = 0;
+    int chan = 0;
 
     /* unshared：当前 lock，嵌套安全 */
     t = sched_tag_enter_unshared(&lock);

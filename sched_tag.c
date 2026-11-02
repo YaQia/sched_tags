@@ -1,7 +1,8 @@
 /*===-- sched_tag.c - single-instance sched_hint support ------------------===*\
 |*                                                                            *|
-|* The per-thread slot cache, the per-thread prctl() registration, and the     *|
-|* fork() hook live here, exactly once, and are linked in as libsched_tag.     *|
+|* The per-thread slot cache, the per-thread prctl() registration, the        *|
+|* process-wide key salt, and the fork() hook live here, exactly once, and    *|
+|* are linked in as libsched_tag.                                             *|
 |*                                                                            *|
 |* Why a library and not header-only: a constructor emitted from a header (or  *|
 |* from the LLVM pass) is emitted once per translation unit, and ELF/LLVM      *|
@@ -21,10 +22,46 @@
 
 #include <pthread.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
+#include <time.h>
+#include <unistd.h>
 
 /* The one definition of the per-thread cache (declared extern in sched_tag.h). */
 __thread struct sched_hint *__sched_hint_ptr
     __attribute__((tls_model("initial-exec")));
+
+/*
+ * Process-wide salt for pointer identity keys. Every thread shares it, so the
+ * same lock address maps to the same key inside one process. It is deliberately
+ * not the raw virtual address, so the scheduler never sees user VAs.
+ */
+uint64_t __sched_tag_process_salt;
+
+static uint64_t __sched_tag_make_salt(void)
+{
+    uint64_t secret = 0;
+    uint64_t fallback;
+    struct timespec ts;
+
+    /*
+     * Prefer the kernel CSPRNG. It is initialized before userspace runs in
+     * normal boots, so this is a one-time cold-path call.
+     */
+    if (getrandom(&secret, sizeof(secret), 0) == (ssize_t)sizeof(secret) &&
+        secret)
+        return secret;
+
+    /*
+     * Fallback: mix time, pid and a stack address. This is only a privacy
+     * barrier, not a security boundary; the scheduler must not rely on the
+     * key being unpredictable.
+     */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fallback = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^
+               ((uint64_t)getpid() << 16) ^ (uint64_t)(uintptr_t)&secret;
+    fallback = sched_tag_hash64(fallback);
+    return fallback ? fallback : 0x9E3779B97F4A7C15ULL;
+}
 
 struct sched_hint *__sched_hint_register(void)
 {
@@ -57,9 +94,14 @@ static void __sched_hint_atfork_child(void)
     __sched_hint_ptr = NULL;
 }
 
-/* One definition, so exactly one .init_array entry and exactly one run. */
-__attribute__((constructor))
-static void __sched_hint_atfork_init(void)
+/*
+ * Priority 101 runs before ordinary user constructors (default priority
+ * 65535), so the salt is ready before any application constructor can tag.
+ */
+__attribute__((constructor(101)))
+static void __sched_hint_init(void)
 {
+    __sched_tag_process_salt = __sched_tag_make_salt();
+    /* One definition, so exactly one .init_array entry and exactly one run. */
     pthread_atfork(NULL, NULL, __sched_hint_atfork_child);
 }

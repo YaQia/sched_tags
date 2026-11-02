@@ -11,21 +11,23 @@
 
 ### 1. 仅带状态的标签
 
-| 标签           | state 值                                                   | 调度器用途                                                              |
-| -------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `funit_dense`  | `SCHED_FUNIT_INT` / `FLOAT` / `SIMD` / `CTRL` 的 bitmask    | SMT 配对：功能单元掩码不相交的任务适合作同核兄弟线程                    |
-| `memory_dense` | `SCHED_MEMORY_STREAM` / `SCHED_MEMORY_RANDOM`              | STREAM 适合顺序扫描；RANDOM 避免同类配对，减少 cache/NUMA 冲突          |
-| `load_ahead`   | `SCHED_LOAD_RISING` / `SCHED_LOAD_FALLING`                 | 负载预告：RISING 提前升频，FALLING 提前降频/进入深 C-state              |
+| 标签           | state 值                                                 | 调度器用途                                                     |
+| -------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
+| `funit_dense`  | `SCHED_FUNIT_INT` / `FLOAT` / `SIMD` / `CTRL` 的 bitmask | SMT 配对：功能单元掩码不相交的任务适合作同核兄弟线程           |
+| `memory_dense` | `SCHED_MEMORY_STREAM` / `SCHED_MEMORY_RANDOM`            | STREAM 适合顺序扫描；RANDOM 避免同类配对，减少 cache/NUMA 冲突 |
+| `load_ahead`   | `SCHED_LOAD_RISING` / `SCHED_LOAD_FALLING`               | 负载预告：RISING 提前升频，FALLING 提前降频/进入深 C-state     |
 
 这三个标签只写 state byte，没有附加信息；用 `sched_tag_set()` 或对应的状态写入即可。
 
 ### 2. 带附加信息的标签
 
-| 标签           | 附加信息（magic key）         | 写入方式                 | 调度器用途                                      |
-| -------------- | ----------------------------- | ------------------------ | ----------------------------------------------- |
-| `unshared`     | 当前唯一 lock 的 key          | 覆盖 + token 恢复        | 按 lock key 统计 waiter，决定是否扩展时间片      |
-| `atomic_dense` | 原子变量集合的 exact set hash | XOR 累加 + clear/restore | 按集合 key 共置；集合完全相同才优化         |
-| `dep_role`     | 当前 pipe 的 key              | 覆盖 + token 恢复        | 按 pipe key + role 配对 producer/consumer       |
+这些标签同时有 **state byte** 和 **附加 magic key**：state 表示当前是否 active / role，magic 用于标识具体的 lock / 集合 / pipe。
+
+| 标签           | state 值                                            | 附加信息（magic key）         | 写入方式                 | 调度器用途                                  |
+| -------------- | --------------------------------------------------- | ----------------------------- | ------------------------ | ------------------------------------------- |
+| `unshared`     | `SCHED_UNSHARED_HELD` / `NONE`                      | 当前唯一 lock 的 key          | 覆盖 + token 恢复        | 按 lock key 统计 waiter，决定是否扩展时间片 |
+| `atomic_dense` | `SCHED_ATOMIC_DENSE` / `NONE`                       | 原子变量集合的 exact set hash | XOR 累加 + clear/restore | 按集合 key 共置；集合完全相同才优化         |
+| `dep_role`     | `SCHED_DEP_NONE` / `PRODUCER` / `CONSUMER` / `BOTH` | 当前 pipe 的 key              | 覆盖 + token 恢复        | 按 pipe key + role 配对 producer/consumer   |
 
 这三个标签的 magic 都是 **exact key**：只有 key 完全相等，才表示同一个 lock / 集合 / pipe。
 

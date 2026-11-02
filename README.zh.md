@@ -76,8 +76,64 @@ cc -Iinclude -I/path/to/kernel/usr/include your.c libsched_tag.a -o your
 ```
 
 `unshared` / `atomic` / `dep` 都有 `_id` 变体，用于静态 ID 或跨进程对象。
-`funit_dense` / `memory_dense` / `load_ahead` 仍可通过兼容接口
-`sched_tag_set()` 写入。
+
+## 兼容接口 `sched_tag_set()`
+
+`sched_tag_set()` 保留给旧代码和简单场景。它**不保存/恢复外层状态**，所以嵌套区域仍应使用 `enter_*` / `leave_*`。
+
+### 两种参数形式
+
+```c
+/* 只写 state byte，不带 magic */
+sched_tag_set(TYPE, value);
+
+/* 写 state + exact key（C11 用 _Generic 自动区分指针和整数） */
+sched_tag_set(TYPE, value, &object);   /* pointer identity */
+sched_tag_set(TYPE, value, 0xDEADBEEF); /* static id identity */
+```
+
+- 指针形式：`key = hash64(ptr ^ per-process salt)`
+- 整数形式：`key = hash64(id)`，用于跨进程对象
+- `value = 0` 时，对应 magic 会被清 0
+
+### 每种标签的语义
+
+```c
+/* 非作用域标签：只有 state */
+sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_INT);
+sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_STREAM);
+sched_tag_set(LOAD_AHEAD, SCHED_LOAD_RISING);
+sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_NONE); /* 清空 */
+
+/* unshared：当前 lock 的 exact key */
+sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, &lock);
+/* ... critical section ... */
+sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE); /* state 和 magic 一起清 */
+
+/* 跨进程 lock：静态 id */
+sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, 0xDEADBEEF12345678ULL);
+sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE);
+
+/* dep：当前 pipe + role */
+sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, &pipe);
+sched_tag_set(DEP_ROLE, SCHED_DEP_NONE);
+
+/* atomic：只适合单变量集合 */
+sched_tag_set(ATOMIC_DENSE, SCHED_ATOMIC_DENSE, &counter);
+sched_tag_set(ATOMIC_DENSE, SCHED_ATOMIC_NONE);
+```
+
+多变量 atomic 集合不要连续调用三次 `sched_tag_set(..., &var)`，否则后一个会覆盖前一个；请使用：
+
+```c
+struct sched_tag_token t = sched_tag_enter_atomic();
+sched_tag_add_atomic(&counter_a);
+sched_tag_add_atomic(&counter_b);
+/* ... */
+sched_tag_leave_atomic(&t);
+```
+
+C++ 下 `sched_tag_set` 是重载函数；C11 下用 `_Generic` 区分 `&object` 和整数 id。C99 及更早版本没有自动区分，三参数形式会按指针处理；静态 id 请使用 `sched_tag_enter_*_id()` 这类 API。
 
 ## 读取
 

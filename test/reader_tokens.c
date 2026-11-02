@@ -197,6 +197,38 @@ int main(void)
         check_key("compat unshared clear key", 0, fake_slot.unshared_magic);
     }
 
+    reset_slot();
+    {
+        sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_INT);
+        check_u8("compat funit state", SCHED_FUNIT_INT,
+                 fake_slot.funit_dense);
+        sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_NONE);
+        check_u8("compat funit clear", SCHED_FUNIT_NONE,
+                 fake_slot.funit_dense);
+    }
+
+    reset_slot();
+    {
+        sched_tag_set(ATOMIC_DENSE, SCHED_ATOMIC_DENSE, &atomic_a);
+        check_u8("compat atomic single state", SCHED_ATOMIC_DENSE,
+                 fake_slot.atomic_dense);
+        check_key("compat atomic single key", ka, fake_slot.atomic_magic);
+        sched_tag_set(ATOMIC_DENSE, SCHED_ATOMIC_NONE);
+        check_u8("compat atomic clear state", SCHED_ATOMIC_NONE,
+                 fake_slot.atomic_dense);
+        check_key("compat atomic clear key", 0, fake_slot.atomic_magic);
+    }
+
+    reset_slot();
+    {
+        sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, &pipe_q1);
+        check_u8("compat dep state", SCHED_DEP_CONSUMER, fake_slot.dep_role);
+        check_key("compat dep key", q1, fake_slot.dep_magic);
+        sched_tag_set(DEP_ROLE, SCHED_DEP_NONE);
+        check_u8("compat dep clear state", SCHED_DEP_NONE, fake_slot.dep_role);
+        check_key("compat dep clear key", 0, fake_slot.dep_magic);
+    }
+
     printf("\n=== %s (%d failure(s)) ===\n",
            failures == 0 ? "ALL PASSED" : "SOME FAILED", failures);
     return failures != 0;

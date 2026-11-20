@@ -7,6 +7,8 @@
 - 不需要支持 `PR_SET_SCHED_HINT` 的内核
 - 覆盖：
   - unshared 嵌套 save/restore
+  - compute mask 嵌套 save/restore
+  - memory locality key / 读写模式 / save/restore
   - atomic exact set hash、部分重叠差异、clear/restore
   - dep PRODUCER / CONSUMER / BOTH / 静态 id
   - 兼容 `sched_tag_set()`

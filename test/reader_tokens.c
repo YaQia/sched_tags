@@ -73,12 +73,12 @@ int main(void)
     /* --- unshared: overwrite + nested restore --- */
     reset_slot();
     {
-        struct sched_tag_token outer = sched_tag_enter_unshared(&lock_a);
+        struct sched_tag_unshared outer = sched_tag_enter_unshared(&lock_a);
         check_u8("unshared outer state", SCHED_UNSHARED_HELD,
                  fake_slot.unshared);
         check_key("unshared outer key", key_a, fake_slot.unshared_magic);
 
-        struct sched_tag_token inner = sched_tag_enter_unshared(&lock_b);
+        struct sched_tag_unshared inner = sched_tag_enter_unshared(&lock_b);
         check_key("unshared inner key", key_b, fake_slot.unshared_magic);
 
         sched_tag_leave_unshared(&inner);
@@ -94,16 +94,39 @@ int main(void)
     /* --- unshared: static id variant --- */
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_unshared_id(0xDEADBEEFULL);
+        struct sched_tag_unshared t = sched_tag_enter_unshared_id(0xDEADBEEFULL);
         check_key("unshared _id key", sched_tag_key_id(0xDEADBEEFULL),
                   fake_slot.unshared_magic);
         sched_tag_leave_unshared(&t);
     }
 
+    /* --- compute: overwrite + nested restore --- */
+    reset_slot();
+    {
+        struct sched_tag_compute outer =
+            sched_tag_enter_compute(SCHED_COMPUTE_INT);
+        check_u8("compute outer state", SCHED_COMPUTE_INT,
+                 fake_slot.compute_dense);
+
+        struct sched_tag_compute inner =
+            sched_tag_enter_compute(SCHED_COMPUTE_INT | SCHED_COMPUTE_SIMD);
+        check_u8("compute inner state",
+                 SCHED_COMPUTE_INT | SCHED_COMPUTE_SIMD,
+                 fake_slot.compute_dense);
+
+        sched_tag_leave_compute(&inner);
+        check_u8("compute leave restores outer", SCHED_COMPUTE_INT,
+                 fake_slot.compute_dense);
+
+        sched_tag_leave_compute(&outer);
+        check_u8("compute outer leave state", SCHED_COMPUTE_NONE,
+                 fake_slot.compute_dense);
+    }
+
     /* --- atomic: exact set hash, order independent, restore --- */
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_atomic();
+        struct sched_tag_atomic t = sched_tag_enter_atomic();
         sched_tag_add_atomic(&atomic_a);
         sched_tag_add_atomic(&atomic_b);
         check_u8("atomic set state", SCHED_ATOMIC_DENSE,
@@ -122,7 +145,7 @@ int main(void)
     /* --- atomic: partial overlap is a different exact key --- */
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_atomic();
+        struct sched_tag_atomic t = sched_tag_enter_atomic();
         sched_tag_add_atomic(&atomic_a);
         check_key("atomic {a} hash", ka, fake_slot.atomic_magic);
         check_u8("atomic {a} != {a,b}", 1, ka != (ka ^ kb));
@@ -136,12 +159,12 @@ int main(void)
     /* --- dep: handoff key + role, nesting, BOTH, static id --- */
     reset_slot();
     {
-        struct sched_tag_token p = sched_tag_enter_dep(&handoff_q1,
+        struct sched_tag_dep p = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_PRODUCER);
         check_u8("dep producer role", SCHED_DEP_PRODUCER, fake_slot.dep_role);
         check_key("dep producer handoff", q1, fake_slot.dep_magic);
 
-        struct sched_tag_token c = sched_tag_enter_dep(&handoff_q2,
+        struct sched_tag_dep c = sched_tag_enter_dep(&handoff_q2,
                                                        SCHED_DEP_CONSUMER);
         check_u8("dep consumer role", SCHED_DEP_CONSUMER, fake_slot.dep_role);
         check_key("dep consumer handoff", q2, fake_slot.dep_magic);
@@ -159,7 +182,7 @@ int main(void)
 
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_dep(&handoff_q1,
+        struct sched_tag_dep t = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_BOTH);
         check_u8("dep BOTH role", SCHED_DEP_BOTH, fake_slot.dep_role);
         check_key("dep BOTH handoff", q1, fake_slot.dep_magic);
@@ -168,7 +191,7 @@ int main(void)
 
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_dep_id(0xCAFEBABEULL,
+        struct sched_tag_dep t = sched_tag_enter_dep_id(0xCAFEBABEULL,
                                                           SCHED_DEP_CONSUMER);
         check_key("dep _id handoff", sched_tag_key_id(0xCAFEBABEULL),
                   fake_slot.dep_magic);
@@ -177,11 +200,109 @@ int main(void)
 
     reset_slot();
     {
-        struct sched_tag_token t = sched_tag_enter_dep(&handoff_q1,
+        struct sched_tag_dep t = sched_tag_enter_dep(&handoff_q1,
                                                        SCHED_DEP_NONE);
         check_u8("dep NONE role", SCHED_DEP_NONE, fake_slot.dep_role);
         check_key("dep NONE clears handoff", 0, fake_slot.dep_magic);
         sched_tag_leave_dep(&t);
+    }
+
+    /* --- memory_dense: locality keys + read/write mode, nesting --- */
+    reset_slot();
+    {
+        int local_a = 0, local_b = 0;
+        const void *l0[] = { &local_a };
+        const void *l1[] = { &local_a, &local_b };
+        uint64_t g0 = sched_tag_global_id(1, 100);
+        uint64_t g1 = sched_tag_global_id(1, 200);
+        uint64_t lk0 = __sched_tag_memory_local_key(l0, 1);
+        uint64_t lk1 = __sched_tag_memory_local_key(l1, 2);
+
+        struct sched_tag_memory outer =
+            sched_tag_enter_memory(SCHED_MEMORY_READ_MOSTLY, g0, l0, 1);
+        check_u8("memory outer state", SCHED_MEMORY_READ_MOSTLY,
+                 fake_slot.memory_dense);
+        check_key("memory outer local", lk0, fake_slot.local_memory_magic);
+        check_key("memory outer global", g0, fake_slot.global_memory_magic);
+
+        struct sched_tag_memory inner =
+            sched_tag_enter_memory(SCHED_MEMORY_WRITE_HEAVY, g1, l1, 2);
+        check_u8("memory inner state", SCHED_MEMORY_WRITE_HEAVY,
+                 fake_slot.memory_dense);
+        check_key("memory inner local", lk1, fake_slot.local_memory_magic);
+        check_key("memory inner global", g1, fake_slot.global_memory_magic);
+
+        sched_tag_leave_memory(&inner);
+        check_u8("memory leave restores state", SCHED_MEMORY_READ_MOSTLY,
+                 fake_slot.memory_dense);
+        check_key("memory leave restores local", lk0,
+                  fake_slot.local_memory_magic);
+        check_key("memory leave restores global", g0,
+                  fake_slot.global_memory_magic);
+
+        sched_tag_leave_memory(&outer);
+        check_u8("memory outer leave state", SCHED_MEMORY_NONE,
+                 fake_slot.memory_dense);
+        check_key("memory outer leave local", 0,
+                  fake_slot.local_memory_magic);
+        check_key("memory outer leave global", 0,
+                  fake_slot.global_memory_magic);
+    }
+
+    reset_slot();
+    {
+        int local_a = 0, local_b = 0;
+        uint64_t g0 = sched_tag_global_id(2, 100);
+        uint64_t g1 = sched_tag_global_id(2, 200);
+        const void *l0[] = { &local_a };
+        const void *l1[] = { &local_b };
+
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, g0, &local_a);
+        check_u8("memory set both state", SCHED_MEMORY_WRITE_HEAVY,
+                 fake_slot.memory_dense);
+        check_key("memory set both local",
+                  __sched_tag_memory_local_key(l0, 1),
+                  fake_slot.local_memory_magic);
+        check_key("memory set both global", g0, fake_slot.global_memory_magic);
+
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_READ_MOSTLY, &local_b);
+        check_u8("memory set local state", SCHED_MEMORY_READ_MOSTLY,
+                 fake_slot.memory_dense);
+        check_key("memory set local only",
+                  __sched_tag_memory_local_key(l1, 1),
+                  fake_slot.local_memory_magic);
+        check_key("memory set local clears global", 0,
+                  fake_slot.global_memory_magic);
+
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, g1);
+        check_u8("memory set global state", SCHED_MEMORY_WRITE_HEAVY,
+                 fake_slot.memory_dense);
+        check_key("memory set global clears local", 0,
+                  fake_slot.local_memory_magic);
+        check_key("memory set global only", g1,
+                  fake_slot.global_memory_magic);
+
+        check_u8("memory get state", SCHED_MEMORY_WRITE_HEAVY,
+                 sched_tag_get(MEMORY_DENSE));
+
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_NONE);
+        check_u8("memory clear state", SCHED_MEMORY_NONE,
+                 fake_slot.memory_dense);
+        check_key("memory clear local", 0, fake_slot.local_memory_magic);
+        check_key("memory clear global", 0, fake_slot.global_memory_magic);
+    }
+
+    reset_slot();
+    {
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY,
+                      sched_tag_global_id(3, 100), &atomic_a);
+        sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_READ_MOSTLY);
+        check_u8("compat memory state", SCHED_MEMORY_READ_MOSTLY,
+                 fake_slot.memory_dense);
+        check_key("compat memory clears local", 0,
+                  fake_slot.local_memory_magic);
+        check_key("compat memory clears global", 0,
+                  fake_slot.global_memory_magic);
     }
 
     /* --- compatibility sched_tag_set() --- */

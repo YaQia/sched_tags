@@ -199,12 +199,12 @@ int main(void)
 
     reset_slot();
     {
-        sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_INT);
-        check_u8("compat funit state", SCHED_FUNIT_INT,
-                 fake_slot.funit_dense);
-        sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_NONE);
-        check_u8("compat funit clear", SCHED_FUNIT_NONE,
-                 fake_slot.funit_dense);
+        sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_INT);
+        check_u8("compat compute state", SCHED_COMPUTE_INT,
+                 fake_slot.compute_dense);
+        sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_NONE);
+        check_u8("compat compute clear", SCHED_COMPUTE_NONE,
+                 fake_slot.compute_dense);
     }
 
     reset_slot();

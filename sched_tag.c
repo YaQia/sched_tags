@@ -4,12 +4,12 @@
 |* process-wide key salt, and the fork() hook live here, exactly once, and    *|
 |* are linked in as libsched_tag.                                             *|
 |*                                                                            *|
-|* Why a library and not header-only: a constructor emitted from a header (or  *|
-|* from the LLVM pass) is emitted once per translation unit, and ELF/LLVM      *|
-|* constructors are appending, so the merged constructor still runs once per   *|
-|* TU. In a large project (thousands of TUs) that means thousands of           *|
-|* .init_array entries and thousands of pointless calls. Emitting this from a   *|
-|* single TU makes it exactly one entry.                                      *|
+|* Why a library and not header-only: a constructor emitted from a header is  *|
+|* emitted once per translation unit, and ELF constructors are appending, so  *|
+|* the merged constructor still runs once per TU. In a large project          *|
+|* (thousands of TUs) that means thousands of .init_array entries and         *|
+|* thousands of pointless calls. Emitting this from a single TU makes it      *|
+|* exactly one entry.                                                         *|
 |*                                                                            *|
 |* The symbols talk to the kernel via the sched_hint ABI, hence the            *|
 |* __sched_hint_* names; the library as a whole is the userspace "tag" layer,  *|

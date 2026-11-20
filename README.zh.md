@@ -13,11 +13,10 @@
 
 | 标签           | state 值                                                 | 调度器用途                                                     |
 | -------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
-| `funit_dense`  | `SCHED_FUNIT_INT` / `FLOAT` / `SIMD` / `CTRL` 的 bitmask | SMT 配对：功能单元掩码不相交的任务适合作同核兄弟线程           |
+| `compute_dense` | `SCHED_COMPUTE_INT` / `FLOAT` / `SIMD` / `CTRL` 的 bitmask | SMT 配对：compute 掩码不相交的任务适合作同核兄弟线程           |
 | `memory_dense` | `SCHED_MEMORY_STREAM` / `SCHED_MEMORY_RANDOM`            | STREAM 适合顺序扫描；RANDOM 避免同类配对，减少 cache/NUMA 冲突 |
-| `load_ahead`   | `SCHED_LOAD_RISING` / `SCHED_LOAD_FALLING`               | 负载预告：RISING 提前升频，FALLING 提前降频/进入深 C-state     |
 
-这三个标签只写 state byte，没有附加信息；用 `sched_tag_set()` 或对应的状态写入即可。
+这两个标签只写 state byte，没有附加信息；用 `sched_tag_set()` 或对应的状态写入即可。
 
 ### 2. 带附加信息的标签
 
@@ -130,10 +129,9 @@ sched_tag_set(TYPE, value, 0xDEADBEEF); /* static id key */
 
 ```c
 /* 非作用域标签：只有 state */
-sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_INT);
+sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_INT);
 sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_STREAM);
-sched_tag_set(LOAD_AHEAD, SCHED_LOAD_RISING);
-sched_tag_set(FUNIT_DENSE, SCHED_FUNIT_NONE); /* 清空 */
+sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_NONE); /* 清空 */
 
 /* unshared：当前 lock 的 exact key */
 sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, &lock);
@@ -191,4 +189,4 @@ dep role 和兼容 setter，不需要支持 `PR_SET_SCHED_HINT` 的内核。
 ## 分支
 
 - `master`：源码 API + 库 + token API 测试
-- `deprecated/pass`：旧的 LLVM Pass / SchedQL / JSON 工具链快照
+- `deprecated/pass`：旧的插桩工具链 / SchedQL / JSON 快照

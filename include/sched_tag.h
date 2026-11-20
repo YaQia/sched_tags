@@ -69,8 +69,8 @@ extern "C" {
 
 /*
  * Per-thread slot cache, defined once in the library (libsched_tag).
- * Shared by every translation unit and by the LLVM pass, so all writers and
- * readers hit the same cell for the current thread.
+ * Shared by every translation unit, so all writers and readers hit the same
+ * cell for the current thread.
  *
  * NULL                   — not yet registered (first use registers)
  * __SCHED_HINT_DISABLED  — registration failed; give up for this thread
@@ -125,19 +125,18 @@ static inline struct sched_hint *__sched_hint_slot(void)
 
 /* Tag types corresponding to sched_hint fields */
 typedef enum {
-    FUNIT_DENSE,
+    COMPUTE_DENSE,
     MEMORY_DENSE,
     ATOMIC_DENSE,
     UNSHARED,
-    DEP_ROLE,
-    LOAD_AHEAD
+    DEP_ROLE
 } sched_tag_type_t;
 
 /*
  * Nesting token. It records the fields that the matching enter/leave pair
  * overwrites, so leave can restore the outer tag exactly. `role` is used by
- * dep; `state` by unshared/atomic. Keep this layout stable if the LLVM pass
- * ever chooses to materialize it.
+ * dep; `state` by unshared/atomic. Keep this layout stable if a tool ever
+ * chooses to materialize it.
  */
 struct sched_tag_token {
     uint64_t magic;
@@ -156,8 +155,8 @@ struct sched_tag_token {
  * hash64 is a stable non-cryptographic 64-bit hash. One odd-constant multiply
  * plus an xor-fold keeps it a bijection (different inputs cannot collide), while
  * the dependency chain stays short (~5 cycles) and independent pointers can be
- * hashed in parallel. Its arithmetic must match the LLVM pass and any
- * cross-process producer of the same static id.
+ * hashed in parallel. Its arithmetic must match any cross-process producer of
+ * the same static id.
  */
 #define SCHED_TAG_HASH_MULT 0x9E3779B97F4A7C15ULL
 
@@ -252,7 +251,7 @@ static inline void sched_tag_add_atomic_key(uint64_t key)
         return;
     h->atomic_dense = SCHED_ATOMIC_DENSE;
     /* XOR is commutative, so set order does not matter. Each variable must
-     * be added exactly once per region (the LLVM pass deduplicates). */
+     * be added exactly once per region (callers should deduplicate). */
     h->atomic_magic ^= key;
 }
 
@@ -365,12 +364,11 @@ static inline uint8_t sched_tag_get(sched_tag_type_t type) {
     if (!hint)
         return 0;
     switch (type) {
-        case FUNIT_DENSE:   return hint->funit_dense;
+        case COMPUTE_DENSE: return hint->compute_dense;
         case MEMORY_DENSE:  return hint->memory_dense;
         case ATOMIC_DENSE:  return hint->atomic_dense;
         case UNSHARED:      return hint->unshared;
         case DEP_ROLE:      return hint->dep_role;
-        case LOAD_AHEAD:    return hint->load_ahead;
     }
     return 0;
 }
@@ -422,12 +420,11 @@ static inline struct sched_hint *__sched_tag_set_base(sched_tag_type_t type, uin
     if (!hint)
         return NULL;
     switch (type) {
-        case FUNIT_DENSE:   hint->funit_dense   = value; break;
+        case COMPUTE_DENSE: hint->compute_dense = value; break;
         case MEMORY_DENSE:  hint->memory_dense  = value; break;
         case ATOMIC_DENSE:  hint->atomic_dense  = value; if (!value) hint->atomic_magic = 0; break;
         case UNSHARED:      hint->unshared      = value; if (!value) hint->unshared_magic = 0; break;
         case DEP_ROLE:      hint->dep_role      = value; if (!value) hint->dep_magic = 0; break;
-        case LOAD_AHEAD:    hint->load_ahead    = value; break;
     }
     return hint;
 }

@@ -21,5 +21,5 @@ cc -std=c11 -Iinclude -I/path/to/kernel/usr/include \
 ./test/reader_tokens
 ```
 
-旧的 LLVM Pass 读者测试、SchedQL 测试和 JSON 配置测试保存在
+旧的插桩工具链读者测试、SchedQL 测试和 JSON 配置测试保存在
 `deprecated/pass` 分支。

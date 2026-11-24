@@ -8,7 +8,8 @@
 - 覆盖：
   - unshared 嵌套 save/restore
   - compute mask 嵌套 save/restore
-  - memory locality key / 读写模式 / save/restore
+  - memory local set hash / global entry / save/restore
+  - atomic / unshared / dep global entry 与 local add 拒绝
   - atomic exact set hash、部分重叠差异、clear/restore
   - dep PRODUCER / CONSUMER / BOTH / 静态 id
   - 兼容 `sched_tag_set()`

@@ -36,7 +36,7 @@
 |*      recv(q, ...);                                                         *|
 |*      sched_tag_leave_dep(&t);                                              *|
 |*                                                                            *|
-|*   4. Cross-process / static identity (all API calls have an _id variant):  *|
+|*   4. Cross-process / global identity (all magic tags have an _id variant):  *|
 |*      struct sched_tag_unshared t = sched_tag_enter_unshared_id(0xDEADBEEF); *|
 |*      ...                                                                   *|
 |*      sched_tag_leave_unshared(&t);                                         *|
@@ -84,8 +84,7 @@ struct sched_tag_compute {
 };
 
 struct sched_tag_memory {
-    uint64_t local_magic;
-    uint64_t global_magic;
+    uint64_t magic;
     uint8_t  state;
 };
 
@@ -110,8 +109,11 @@ static inline struct sched_tag_compute sched_tag_enter_compute(uint8_t mask);
 static inline void sched_tag_leave_compute(struct sched_tag_compute *t);
 
 static inline struct sched_tag_memory
-sched_tag_enter_memory(uint8_t state, uint64_t global_id,
-                       const void *const local[], unsigned int nr_local);
+sched_tag_enter_memory(uint8_t state);
+static inline struct sched_tag_memory
+sched_tag_enter_memory_id(uint8_t state, uint64_t id);
+static inline void sched_tag_add_memory(const void *addr);
+static inline void sched_tag_add_memory_id(uint64_t id);
 static inline void sched_tag_leave_memory(struct sched_tag_memory *t);
 
 static inline struct sched_tag_unshared
@@ -121,6 +123,8 @@ sched_tag_enter_unshared_id(uint64_t id);
 static inline void sched_tag_leave_unshared(struct sched_tag_unshared *t);
 
 static inline struct sched_tag_atomic sched_tag_enter_atomic(void);
+static inline struct sched_tag_atomic
+sched_tag_enter_atomic_id(uint64_t id);
 static inline void sched_tag_add_atomic(const void *var);
 static inline void sched_tag_add_atomic_id(uint64_t id);
 static inline void sched_tag_clear_atomic(void);
@@ -146,6 +150,8 @@ static inline uint64_t sched_tag_global_id(uint64_t dev, uint64_t ino);
 
 /* The compatibility sched_tag_set() is defined below. */
 
+/* The compatibility sched_tag_set() is defined below. */
+
 /*
  * Per-thread slot cache, defined once in the library (libsched_tag).
  * Shared by every translation unit, so all writers and readers hit the same
@@ -165,8 +171,8 @@ extern __thread struct sched_hint *__sched_hint_ptr
 /*
  * Per-process hash salt, defined once in the library and initialized by its
  * constructor. All threads in the process share it. Pointer keys are only
- * meaningful inside this process; use the _id variants / static ids for
- * objects that must match across processes.
+ * meaningful inside this process; use the _id variants for cross-process
+ * global identities.
  */
 extern uint64_t __sched_tag_process_salt;
 
@@ -242,39 +248,14 @@ static inline uint64_t sched_tag_global_id(uint64_t dev, uint64_t ino) {
 
 #define SCHED_TAG_PAGE_SHIFT 12
 
-static inline uint64_t
-__sched_tag_memory_local_key(const void *const local[], unsigned int nr_local)
+static inline uint64_t __sched_tag_memory_page_key(const void *addr)
 {
-    uint16_t lane[4] = {0xffff, 0xffff, 0xffff, 0xffff};
-    bool any = false;
-    unsigned int i, j;
+    uint64_t page;
 
-    if (!local)
+    if (!addr)
         return 0;
-    if (nr_local > 4)
-        nr_local = 4;
-
-    for (j = 0; j < nr_local; j++) {
-        uint64_t page;
-
-        if (!local[j])
-            continue;
-        any = true;
-        page = (uint64_t)(uintptr_t)local[j] >> SCHED_TAG_PAGE_SHIFT;
-        for (i = 0; i < 4; i++) {
-            uint16_t v = (uint16_t)sched_tag_hash64(
-                page ^ __sched_tag_process_salt ^
-                (SCHED_TAG_HASH_MULT * (i + 1)));
-
-            if (v < lane[i])
-                lane[i] = v;
-        }
-    }
-
-    if (!any)
-        return 0;
-    return ((uint64_t)lane[0] << 48) | ((uint64_t)lane[1] << 32) |
-           ((uint64_t)lane[2] << 16) | (uint64_t)lane[3];
+    page = (uint64_t)(uintptr_t)addr >> SCHED_TAG_PAGE_SHIFT;
+    return sched_tag_hash64(page ^ __sched_tag_process_salt);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -312,7 +293,7 @@ static inline void sched_tag_leave_compute(struct sched_tag_compute *t)
 /* ------------------------------------------------------------------------- */
 
 static inline struct sched_tag_unshared
-__sched_tag_enter_unshared_key(uint64_t key)
+__sched_tag_enter_unshared_key(uint64_t key, uint8_t state)
 {
     struct sched_tag_unshared t = {0};
     struct sched_hint *h = __sched_hint_slot();
@@ -321,7 +302,7 @@ __sched_tag_enter_unshared_key(uint64_t key)
         return t;
     t.magic = h->unshared_magic;
     t.state = h->unshared;
-    h->unshared = SCHED_UNSHARED_HELD;
+    h->unshared = state;
     h->unshared_magic = key;
     return t;
 }
@@ -329,13 +310,16 @@ __sched_tag_enter_unshared_key(uint64_t key)
 static inline struct sched_tag_unshared
 sched_tag_enter_unshared(const void *lock)
 {
-    return __sched_tag_enter_unshared_key(sched_tag_key_ptr(lock));
+    return __sched_tag_enter_unshared_key(sched_tag_key_ptr(lock),
+                                          SCHED_UNSHARED_HELD);
 }
 
 static inline struct sched_tag_unshared
 sched_tag_enter_unshared_id(uint64_t id)
 {
-    return __sched_tag_enter_unshared_key(sched_tag_key_id(id));
+    return __sched_tag_enter_unshared_key(id,
+                                          SCHED_UNSHARED_HELD |
+                                          SCHED_UNSHARED_GLOBAL);
 }
 
 static inline void sched_tag_leave_unshared(struct sched_tag_unshared *t)
@@ -372,11 +356,28 @@ static inline struct sched_tag_atomic sched_tag_enter_atomic(void)
     return t;
 }
 
+static inline struct sched_tag_atomic
+sched_tag_enter_atomic_id(uint64_t id)
+{
+    struct sched_tag_atomic t = {0};
+    struct sched_hint *h = __sched_hint_slot();
+
+    if (!h)
+        return t;
+    t.magic = h->atomic_magic;
+    t.state = h->atomic_dense;
+    h->atomic_dense = SCHED_ATOMIC_DENSE | SCHED_ATOMIC_GLOBAL;
+    h->atomic_magic = id;
+    return t;
+}
+
 static inline void sched_tag_add_atomic_key(uint64_t key)
 {
     struct sched_hint *h = __sched_hint_slot();
 
     if (!h)
+        return;
+    if (h->atomic_dense & SCHED_ATOMIC_GLOBAL)
         return;
     h->atomic_dense = SCHED_ATOMIC_DENSE;
     /* XOR is commutative, so set order does not matter. Each variable must
@@ -391,7 +392,13 @@ static inline void sched_tag_add_atomic(const void *var)
 
 static inline void sched_tag_add_atomic_id(uint64_t id)
 {
-    sched_tag_add_atomic_key(sched_tag_key_id(id));
+    struct sched_hint *h = __sched_hint_slot();
+
+    if (!h || !id)
+        return;
+    if (!(h->atomic_dense & SCHED_ATOMIC_GLOBAL))
+        return;
+    h->atomic_magic ^= id;
 }
 
 static inline void sched_tag_clear_atomic(void)
@@ -422,31 +429,69 @@ static inline void sched_tag_leave_atomic(struct sched_tag_atomic *t)
 /* ------------------------------------------------------------------------- */
 /* memory_dense: shared-memory locality + read/write mode                     */
 /*                                                                           */
-/* local_magic  : per-mm hot-page sketch (only meaningful within one mm)      */
-/* global_magic : cross-process shared-object identity                        */
+/* local  : memory_magic is a set hash over hot pages                         */
+/* global : memory_magic is a cross-process object identity                   */
 /* ------------------------------------------------------------------------- */
 
 static inline struct sched_tag_memory
-sched_tag_enter_memory(uint8_t state, uint64_t global_id,
-                       const void *const local[], unsigned int nr_local)
+sched_tag_enter_memory(uint8_t state)
 {
     struct sched_tag_memory t = {0};
     struct sched_hint *h = __sched_hint_slot();
 
     if (!h)
         return t;
-    if (!state) {
-        global_id = 0;
-        local = NULL;
-        nr_local = 0;
-    }
+    state &= SCHED_MEMORY_READ_MOSTLY | SCHED_MEMORY_WRITE_HEAVY;
     t.state = h->memory_dense;
-    t.local_magic = h->local_memory_magic;
-    t.global_magic = h->global_memory_magic;
+    t.magic = h->memory_magic;
     h->memory_dense = state;
-    h->global_memory_magic = global_id;
-    h->local_memory_magic = __sched_tag_memory_local_key(local, nr_local);
+    h->memory_magic = 0;
     return t;
+}
+
+static inline struct sched_tag_memory
+sched_tag_enter_memory_id(uint8_t state, uint64_t id)
+{
+    struct sched_tag_memory t = {0};
+    struct sched_hint *h = __sched_hint_slot();
+
+    if (!h)
+        return t;
+    state &= SCHED_MEMORY_READ_MOSTLY | SCHED_MEMORY_WRITE_HEAVY;
+    t.state = h->memory_dense;
+    t.magic = h->memory_magic;
+    h->memory_dense = state ? (state | SCHED_MEMORY_GLOBAL) :
+                              SCHED_MEMORY_NONE;
+    h->memory_magic = state ? id : 0;
+    return t;
+}
+
+static inline void sched_tag_add_memory(const void *addr)
+{
+    struct sched_hint *h = __sched_hint_slot();
+
+    if (!h || !addr)
+        return;
+    if (!(h->memory_dense & (SCHED_MEMORY_READ_MOSTLY |
+                             SCHED_MEMORY_WRITE_HEAVY)))
+        return;
+    if (h->memory_dense & SCHED_MEMORY_GLOBAL)
+        return;
+    h->memory_magic ^= __sched_tag_memory_page_key(addr);
+}
+
+static inline void sched_tag_add_memory_id(uint64_t id)
+{
+    struct sched_hint *h = __sched_hint_slot();
+
+    if (!h || !id)
+        return;
+    if (!(h->memory_dense & (SCHED_MEMORY_READ_MOSTLY |
+                             SCHED_MEMORY_WRITE_HEAVY)))
+        return;
+    if (!(h->memory_dense & SCHED_MEMORY_GLOBAL))
+        return;
+    h->memory_magic ^= id;
 }
 
 static inline void sched_tag_leave_memory(struct sched_tag_memory *t)
@@ -459,11 +504,9 @@ static inline void sched_tag_leave_memory(struct sched_tag_memory *t)
     if (!h)
         return;
     h->memory_dense = t->state;
-    h->local_memory_magic = t->local_magic;
-    h->global_memory_magic = t->global_magic;
+    h->memory_magic = t->magic;
     t->state = 0;
-    t->local_magic = 0;
-    t->global_magic = 0;
+    t->magic = 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -475,7 +518,7 @@ static inline void sched_tag_leave_memory(struct sched_tag_memory *t)
 /* ------------------------------------------------------------------------- */
 
 static inline struct sched_tag_dep
-__sched_tag_enter_dep_key(uint64_t key, uint8_t role)
+__sched_tag_enter_dep_key(uint64_t key, uint8_t role, uint8_t flags)
 {
     struct sched_tag_dep t = {0};
     struct sched_hint *h = __sched_hint_slot();
@@ -486,7 +529,7 @@ __sched_tag_enter_dep_key(uint64_t key, uint8_t role)
     t.role = h->dep_role;
 
     role &= SCHED_DEP_BOTH;
-    h->dep_role = role;
+    h->dep_role = role ? (role | flags) : SCHED_DEP_NONE;
     h->dep_magic = role ? key : 0;
     return t;
 }
@@ -494,13 +537,13 @@ __sched_tag_enter_dep_key(uint64_t key, uint8_t role)
 static inline struct sched_tag_dep
 sched_tag_enter_dep(const void *handoff, uint8_t role)
 {
-    return __sched_tag_enter_dep_key(sched_tag_key_ptr(handoff), role);
+    return __sched_tag_enter_dep_key(sched_tag_key_ptr(handoff), role, 0);
 }
 
 static inline struct sched_tag_dep
 sched_tag_enter_dep_id(uint64_t id, uint8_t role)
 {
-    return __sched_tag_enter_dep_key(sched_tag_key_id(id), role);
+    return __sched_tag_enter_dep_key(id, role, SCHED_DEP_GLOBAL);
 }
 
 static inline void sched_tag_leave_dep(struct sched_tag_dep *t)
@@ -577,7 +620,7 @@ static inline bool sched_tag_test_magic(sched_tag_type_t type, const void *ptr) 
 }
 
 static inline bool sched_tag_test_magic_id(sched_tag_type_t type, uint64_t id) {
-    return sched_tag_test_key(type, sched_tag_key_id(id));
+    return sched_tag_test_key(type, id);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -588,8 +631,9 @@ static inline bool sched_tag_test_magic_id(sched_tag_type_t type, uint64_t id) {
 /*   unshared / dep : overwrite the current exact key                         */
 /*   atomic         : set the exact one-element set hash (use add_atomic()    */
 /*                    for multi-variable sets, or enter_atomic()/leave)       */
-/*   memory         : 3-arg pointer = local-only, 3-arg id = global-only,    */
-/*                    4-arg (id, ptr) = both.                                 */
+/*   memory         : 3-arg pointer = local single page,                     */
+/*                    3-arg id      = local static identity                  */
+/*   global         : 3-arg integer id; enter_*_id() for scoped global     */
 /* ------------------------------------------------------------------------- */
 
 static inline struct sched_hint *__sched_tag_set_base(sched_tag_type_t type, uint8_t value) {
@@ -598,17 +642,20 @@ static inline struct sched_hint *__sched_tag_set_base(sched_tag_type_t type, uin
         return NULL;
     switch (type) {
         case COMPUTE_DENSE: hint->compute_dense = value; break;
-        case MEMORY_DENSE:  hint->memory_dense  = value;
-                            hint->local_memory_magic = 0;
-                            hint->global_memory_magic = 0; break;
-        case ATOMIC_DENSE:  hint->atomic_dense  = value; if (!value) hint->atomic_magic = 0; break;
-        case UNSHARED:      hint->unshared      = value; if (!value) hint->unshared_magic = 0; break;
-        case DEP_ROLE:      hint->dep_role      = value; if (!value) hint->dep_magic = 0; break;
+        case MEMORY_DENSE:  hint->memory_dense  = value & (SCHED_MEMORY_READ_MOSTLY |
+                                                           SCHED_MEMORY_WRITE_HEAVY);
+                            hint->memory_magic = 0; break;
+        case ATOMIC_DENSE:  hint->atomic_dense  = value & SCHED_ATOMIC_DENSE;
+                            hint->atomic_magic = 0; break;
+        case UNSHARED:      hint->unshared      = value & SCHED_UNSHARED_HELD;
+                            hint->unshared_magic = 0; break;
+        case DEP_ROLE:      hint->dep_role      = value & SCHED_DEP_BOTH;
+                            hint->dep_magic = 0; break;
     }
     return hint;
 }
 
-/* Setter for pointer-based exact-key calculation */
+/* Setter for pointer-based local exact-key calculation */
 static inline void __sched_tag_set_ptr(sched_tag_type_t type, uint8_t value, const void *ptr) {
     struct sched_hint *hint = __sched_tag_set_base(type, value);
     uint64_t key;
@@ -618,47 +665,50 @@ static inline void __sched_tag_set_ptr(sched_tag_type_t type, uint8_t value, con
     switch (type) {
         case ATOMIC_DENSE: hint->atomic_magic = key; break;
         case UNSHARED:     hint->unshared_magic = key; break;
-        case DEP_ROLE:     hint->dep_magic = key; break;
-        case MEMORY_DENSE: {
-            const void *local[1] = { ptr };
-            hint->local_memory_magic = __sched_tag_memory_local_key(local, 1);
-            break;
-        }
+        case DEP_ROLE:     hint->dep_magic = hint->dep_role ? key : 0; break;
+        case MEMORY_DENSE: hint->memory_magic = __sched_tag_memory_page_key(ptr); break;
         default: break;
     }
 }
 
-/* Setter for 64-bit static identity */
+/* Setter for 64-bit global identity */
 static inline void __sched_tag_set_id(sched_tag_type_t type, uint8_t value, uint64_t id) {
-    struct sched_hint *hint = __sched_tag_set_base(type, value);
-    uint64_t key;
-    if (!hint || !value)
-        return;
-    key = sched_tag_key_id(id);
-    switch (type) {
-        case ATOMIC_DENSE: hint->atomic_magic = key; break;
-        case UNSHARED:     hint->unshared_magic = key; break;
-        case DEP_ROLE:     hint->dep_magic = key; break;
-        case MEMORY_DENSE: hint->global_memory_magic = id; break;
-        default: break;
-    }
-}
-
-static inline void
-__sched_tag_set_memory4(sched_tag_type_t type, uint8_t value,
-                        uint64_t id, const void *ptr)
-{
     struct sched_hint *hint;
-    const void *local[1];
 
-    if (type != MEMORY_DENSE)
+    if (type == COMPUTE_DENSE)
         return;
     hint = __sched_tag_set_base(type, value);
     if (!hint || !value)
         return;
-    local[0] = ptr;
-    hint->global_memory_magic = id;
-    hint->local_memory_magic = __sched_tag_memory_local_key(local, 1);
+    switch (type) {
+        case MEMORY_DENSE:
+            if (hint->memory_dense & (SCHED_MEMORY_READ_MOSTLY |
+                                      SCHED_MEMORY_WRITE_HEAVY)) {
+                hint->memory_dense |= SCHED_MEMORY_GLOBAL;
+                hint->memory_magic = id;
+            }
+            break;
+        case ATOMIC_DENSE:
+            if (hint->atomic_dense & SCHED_ATOMIC_DENSE) {
+                hint->atomic_dense |= SCHED_ATOMIC_GLOBAL;
+                hint->atomic_magic = id;
+            }
+            break;
+        case UNSHARED:
+            if (hint->unshared & SCHED_UNSHARED_HELD) {
+                hint->unshared |= SCHED_UNSHARED_GLOBAL;
+                hint->unshared_magic = id;
+            }
+            break;
+        case DEP_ROLE:
+            if (hint->dep_role & SCHED_DEP_BOTH) {
+                hint->dep_role |= SCHED_DEP_GLOBAL;
+                hint->dep_magic = id;
+            }
+            break;
+        default:
+            break;
+    }
 }
 
 #ifdef __cplusplus
@@ -677,11 +727,6 @@ static inline void sched_tag_set(sched_tag_type_t type, uint8_t value, uint64_t 
     __sched_tag_set_id(type, value, id);
 }
 
-static inline void sched_tag_set(sched_tag_type_t type, uint8_t value,
-                                 uint64_t id, const void *ptr) {
-    __sched_tag_set_memory4(type, value, id, ptr);
-}
-
 #else /* __cplusplus */
 
 /* C macros with _Generic for C11 (allows static identity ids vs pointers) */
@@ -695,22 +740,15 @@ static inline void sched_tag_set(sched_tag_type_t type, uint8_t value,
     unsigned long long: __sched_tag_set_id, \
     default: __sched_tag_set_ptr \
 )(type, value, magic)
-#define __sched_tag_4(type, value, id, ptr) do { \
-    _Static_assert((type) == MEMORY_DENSE, \
-                   "4-arg sched_tag_set() is memory_dense only"); \
-    __sched_tag_set_memory4((type), (value), (id), (ptr)); \
-} while (0)
 #else
 /* Fallback for pre-C11: assume magic is a pointer, unless manually cast. */
 #define __sched_tag_3(type, value, magic) __sched_tag_set_ptr(type, value, (const void*)(uintptr_t)(magic))
-#define __sched_tag_4(type, value, id, ptr) \
-    __sched_tag_set_memory4((type), (value), (id), (ptr))
 #endif
 
-/* Macro dispatcher for optional 3rd/4th argument */
-#define __SCHED_TAG_MACRO(_1, _2, _3, _4, NAME, ...) NAME
+/* Macro dispatcher for optional 3rd argument */
+#define __SCHED_TAG_MACRO(_1, _2, _3, NAME, ...) NAME
 #define sched_tag_set(...) \
-    __SCHED_TAG_MACRO(__VA_ARGS__, __sched_tag_4, __sched_tag_3, __sched_tag_set_base)(__VA_ARGS__)
+    __SCHED_TAG_MACRO(__VA_ARGS__, __sched_tag_3, __sched_tag_set_base)(__VA_ARGS__)
 
 #endif /* __cplusplus */
 

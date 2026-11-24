@@ -23,15 +23,15 @@
 
 | 标签           | state 值                                            | 附加信息（magic key）         | 写入方式                 | 调度器用途                                  |
 | -------------- | --------------------------------------------------- | ----------------------------- | ------------------------ | ------------------------------------------- |
-| `memory_dense` | `SCHED_MEMORY_READ_MOSTLY` / `WRITE_HEAVY`          | `local_memory_magic` + `global_memory_magic` | `enter_memory()` / `sched_tag_set()` | 共享热点靠近，写密集时避免跨 LLC |
+| `memory_dense` | `SCHED_MEMORY_READ_MOSTLY` / `WRITE_HEAVY` (+ `SCHED_MEMORY_GLOBAL`) | `memory_magic` | `enter_memory()` / `enter_memory_id()` | 共享热点靠近，写密集时避免跨 LLC |
 | `unshared`     | `SCHED_UNSHARED_HELD` / `NONE`                      | 当前唯一 lock 的 key          | 覆盖 + token 恢复        | 按 lock key 统计 waiter，决定是否扩展时间片 |
 | `atomic_dense` | `SCHED_ATOMIC_DENSE` / `NONE`                       | 原子变量集合的 exact set hash | XOR 累加 + clear/restore | 原子密集任务按集合 key 共置                 |
 | `dep_role`     | `SCHED_DEP_NONE` / `PRODUCER` / `CONSUMER` / `BOTH` | 当前交接对象的 key            | 覆盖 + token 恢复        | 生产者消费者模型的任务按交接对象 key 共置   |
 
-`unshared` / `atomic` / `dep` 的 magic 都是 **exact key**：只有 key 完全相等，才表示同一个 lock / 集合 / 交接对象。`memory_dense` 的两个 magic 语义不同：
+`unshared` / `atomic` / `dep` 的 magic 都是 **exact key**：只有 key 完全相等，才表示同一个 lock / 集合 / 交接对象。`memory_dense` 的 magic 分两种 scope：
 
-- `local_memory_magic`：per-mm 热点页 sketch，用相似度比较（同一个 mm 内才有意义）；
-- `global_memory_magic`：跨进程共享对象的 exact identity，用相等比较。
+- local：进程内热点页的 exact set hash（`addr >> 12`）；
+- global：跨进程共享对象的 exact identity。
 
 magic 的具体编码由库负责，普通用法不需要自己构造；不同标签的编码和比较方式不同，调度器侧按标签分别处理。
 
@@ -56,8 +56,8 @@ magic 的具体编码由库负责，普通用法不需要自己构造；不同�
 - 只在 memory-dense 阶段设置；`SCHED_MEMORY_NONE` 表示当前不在该阶段。
 - `READ_MOSTLY`：写可以忽略，副本可以跨 LLC 分散，利用并行读。
 - `WRITE_HEAVY`：有实质性的写，优先同核 / SMT，其次同 LLC，避免跨 LLC 的 coherence 开销。
-- `local_memory_magic` 只在同一个 mm 内比较；库根据 1~4 个 local 地址生成热点 sketch。
-- 跨进程共享用 `global_memory_magic`，由 `sched_tag_global_id(st_dev, st_ino)` 生成。
+- local：`enter_memory(state)` + `add_memory(&addr)`，库按 `addr >> 12` 做 exact set hash；重复 add 会 XOR 抵消，调用方要保证 dedup。
+- global：`enter_memory_id(state, gid)`，要求同一个 inode 的共享对象；global region 里 `add_memory()` 会被忽略。
 - 有多个共享对象时，只提供当前阶段最主要、最能区分的那个。
 
 > Hints are sampled at scheduling hooks. A hint is only observed if it is active
@@ -89,17 +89,21 @@ void process_data(void) {
     int chan = 0;
     int local_hot = 0;
     uint64_t shm_id = sched_tag_global_id(1, 1234); /* st_dev, st_ino */
-    const void *hot[] = { &local_hot };
 
     /* unshared：当前 lock，嵌套安全 */
     ut = sched_tag_enter_unshared(&lock);
     critical_section();
     sched_tag_leave_unshared(&ut);
 
-    /* memory：当前热点区域 + 读写模式 */
-    mt = sched_tag_enter_memory(SCHED_MEMORY_WRITE_HEAVY,
-                                shm_id, hot, 1);
+    /* memory local：当前热点页 + 读写模式 */
+    mt = sched_tag_enter_memory(SCHED_MEMORY_WRITE_HEAVY);
+    sched_tag_add_memory(&local_hot);
     memory_dense_region();
+    sched_tag_leave_memory(&mt);
+
+    /* memory global：当前共享对象 */
+    mt = sched_tag_enter_memory_id(SCHED_MEMORY_WRITE_HEAVY, shm_id);
+    shared_memory_region();
     sched_tag_leave_memory(&mt);
 
     /* atomic：当前原子变量集合 key */
@@ -112,6 +116,14 @@ void process_data(void) {
     /* dep：当前 pipe + role */
     dt = sched_tag_enter_dep(&pipe, SCHED_DEP_CONSUMER);
     recv(pipe);
+    sched_tag_leave_dep(&dt);
+
+    /* global 入口：用 gid 指定跨进程对象 */
+    at = sched_tag_enter_atomic_id(shm_id);
+    sched_tag_leave_atomic(&at);
+    ut = sched_tag_enter_unshared_id(shm_id);
+    sched_tag_leave_unshared(&ut);
+    dt = sched_tag_enter_dep_id(shm_id, SCHED_DEP_CONSUMER);
     sched_tag_leave_dep(&dt);
 
     /* 跨进程 / 静态 id */
@@ -127,30 +139,27 @@ void process_data(void) {
 cc -Iinclude -I/path/to/kernel/usr/include your.c libsched_tag.a -o your
 ```
 
-`unshared` / `atomic` / `dep` 都有 `_id` 变体，用于静态 ID 或跨进程对象。
+`unshared` / `atomic` / `dep` 都有 `_id` 变体，用于跨进程 global identity；local 使用地址/对象指针。
 
 ## 兼容接口 `sched_tag_set()`
 
 `sched_tag_set()` 保留给旧代码和简单场景。它**不保存/恢复外层状态**，所以嵌套区域仍应使用 `enter_*` / `leave_*`。
 
-### 2 / 3 / 4 参数形式
+### 2 / 3 参数形式
 
 ```c
 /* 只写 state byte，不带 magic */
 sched_tag_set(TYPE, value);
 
 /* 写 state + key（C11 用 _Generic 自动区分指针和整数） */
-sched_tag_set(TYPE, value, &object);   /* pointer key */
-sched_tag_set(TYPE, value, 0xDEADBEEF); /* static id key */
-
-/* 4 参数：仅 MEMORY_DENSE */
-sched_tag_set(MEMORY_DENSE, value, global_id, &local_addr);
+sched_tag_set(TYPE, value, &object);    /* local pointer key */
+sched_tag_set(TYPE, value, 0xDEADBEEF); /* global gid */
 ```
 
-- unshared / atomic / dep：指针和整数 id 都由库转成 exact key
-- memory：指针是 local 热点地址，整数是 `sched_tag_global_id()` 生成的 global_id
+- unshared / atomic / dep：指针是 local key，整数是 global gid
+- memory：指针是 local 单页，整数是 global gid
+- global 也可以用 `enter_*_id()` 做 scoped region
 - `value = 0` 时，对应 magic 会被清 0
-- 4 参数形式只允许 `MEMORY_DENSE`；其他 type 在 C11 下编译期报错
 
 ### 每种标签的语义
 
@@ -160,24 +169,28 @@ sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_INT);
 sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_READ_MOSTLY);
 sched_tag_set(COMPUTE_DENSE, SCHED_COMPUTE_NONE); /* 清空 */
 
-/* memory：local-only / global-only / both */
+/* memory local：单页 / 静态 identity */
 sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, &local_hot);
+sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, 0x1234ULL);
+sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_NONE);
+
+/* memory global */
 sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, shm_id);
-sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_WRITE_HEAVY, shm_id, &local_hot);
-sched_tag_set(MEMORY_DENSE, SCHED_MEMORY_NONE); /* state 和两个 magic 一起清 */
 
 /* unshared：当前 lock 的 exact key */
 sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, &lock);
 /* ... critical section ... */
 sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE); /* state 和 magic 一起清 */
 
-/* 跨进程 lock：静态 id */
-sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, 0xDEADBEEF12345678ULL);
-sched_tag_set(UNSHARED, SCHED_UNSHARED_NONE);
+/* global lock */
+sched_tag_set(UNSHARED, SCHED_UNSHARED_HELD, gid);
 
 /* dep：当前 pipe + role */
 sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, &pipe);
 sched_tag_set(DEP_ROLE, SCHED_DEP_NONE);
+
+/* global handoff */
+sched_tag_set(DEP_ROLE, SCHED_DEP_CONSUMER, gid);
 
 /* atomic：只适合单变量集合 */
 sched_tag_set(ATOMIC_DENSE, SCHED_ATOMIC_DENSE, &counter);
@@ -194,7 +207,7 @@ sched_tag_add_atomic(&counter_b);
 sched_tag_leave_atomic(&t);
 ```
 
-C++ 下 `sched_tag_set` 是重载函数；C11 下用 `_Generic` 区分 `&object` 和整数 id。C99 及更早版本没有自动区分，三参数形式会按指针处理；静态 id 请使用 `sched_tag_enter_*_id()` 这类 API。
+C++ 下 `sched_tag_set` 是重载函数；C11 下用 `_Generic` 区分 `&object` 和整数 gid。C99 及更早版本没有自动区分，三参数形式会按指针处理；global 请使用 `sched_tag_set()` 或 `sched_tag_enter_*_id()`。
 
 ## 读取
 
